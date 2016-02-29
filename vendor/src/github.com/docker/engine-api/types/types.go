@@ -142,11 +142,13 @@ type Container struct {
 	SizeRw     int64 `json:",omitempty"`
 	SizeRootFs int64 `json:",omitempty"`
 	Labels     map[string]string
+	State      string
 	Status     string
 	HostConfig struct {
 		NetworkMode string `json:",omitempty"`
 	}
 	NetworkSettings *SummaryNetworkSettings
+	Mounts          []MountPoint
 }
 
 // CopyConfig contains request body of Remote API:
@@ -192,9 +194,13 @@ type Version struct {
 type Info struct {
 	ID                 string
 	Containers         int
+	ContainersRunning  int
+	ContainersPaused   int
+	ContainersStopped  int
 	Images             int
 	Driver             string
 	DriverStatus       [][2]string
+	SystemStatus       [][2]string
 	Plugins            PluginsInfo
 	MemoryLimit        bool
 	SwapLimit          bool
@@ -212,6 +218,7 @@ type Info struct {
 	SystemTime         string
 	ExecutionDriver    string
 	LoggingDriver      string
+	CgroupDriver       string
 	NEventsListener    int
 	KernelVersion      string
 	OperatingSystem    string
@@ -219,8 +226,6 @@ type Info struct {
 	Architecture       string
 	IndexServerAddress string
 	RegistryConfig     *registry.ServiceConfig
-	InitSha1           string
-	InitPath           string
 	NCPU               int
 	MemTotal           int64
 	DockerRootDir      string
@@ -235,8 +240,8 @@ type Info struct {
 	ClusterAdvertise   string
 }
 
-// PluginsInfo is temp struct holds Plugins name
-// registered with docker daemon. It used by Info struct
+// PluginsInfo is a temp struct holding Plugins name
+// registered with docker daemon. It is used by Info struct
 type PluginsInfo struct {
 	// List of Volume plugins registered
 	Volume []string
@@ -384,7 +389,9 @@ type NetworkResource struct {
 	ID         string `json:"Id"`
 	Scope      string
 	Driver     string
+	EnableIPv6 bool
 	IPAM       network.IPAM
+	Internal   bool
 	Containers map[string]EndpointResource
 	Options    map[string]string
 }
@@ -403,7 +410,9 @@ type NetworkCreate struct {
 	Name           string
 	CheckDuplicate bool
 	Driver         string
+	EnableIPv6     bool
 	IPAM           network.IPAM
+	Internal       bool
 	Options        map[string]string
 }
 
@@ -416,10 +425,11 @@ type NetworkCreateResponse struct {
 // NetworkConnect represents the data to be used to connect a container to the network
 type NetworkConnect struct {
 	Container      string
-	EndpointConfig *network.EndpointSettings `json:"endpoint_config"`
+	EndpointConfig *network.EndpointSettings `json:",omitempty"`
 }
 
 // NetworkDisconnect represents the data to be used to disconnect a container from the network
 type NetworkDisconnect struct {
 	Container string
+	Force     bool
 }

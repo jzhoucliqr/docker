@@ -12,6 +12,7 @@ import (
 )
 
 func (s *DockerSuite) TestStatsNoStream(c *check.C) {
+	// Windows does not support stats
 	testRequires(c, DaemonIsLinux)
 	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
 	id := strings.TrimSpace(out)
@@ -40,6 +41,7 @@ func (s *DockerSuite) TestStatsNoStream(c *check.C) {
 }
 
 func (s *DockerSuite) TestStatsContainerNotFound(c *check.C) {
+	// Windows does not support stats
 	testRequires(c, DaemonIsLinux)
 
 	out, _, err := dockerCmdWithError("stats", "notfound")
@@ -52,6 +54,7 @@ func (s *DockerSuite) TestStatsContainerNotFound(c *check.C) {
 }
 
 func (s *DockerSuite) TestStatsAllRunningNoStream(c *check.C) {
+	// Windows does not support stats
 	testRequires(c, DaemonIsLinux)
 
 	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
@@ -75,6 +78,7 @@ func (s *DockerSuite) TestStatsAllRunningNoStream(c *check.C) {
 }
 
 func (s *DockerSuite) TestStatsAllNoStream(c *check.C) {
+	// Windows does not support stats
 	testRequires(c, DaemonIsLinux)
 
 	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
@@ -92,12 +96,13 @@ func (s *DockerSuite) TestStatsAllNoStream(c *check.C) {
 }
 
 func (s *DockerSuite) TestStatsAllNewContainersAdded(c *check.C) {
+	// Windows does not support stats
 	testRequires(c, DaemonIsLinux)
 
 	id := make(chan string)
 	addedChan := make(chan struct{})
 
-	dockerCmd(c, "run", "-d", "busybox", "top")
+	runSleepingContainer(c, "-d")
 	statsCmd := exec.Command(dockerBinary, "stats")
 	stdout, err := statsCmd.StdoutPipe()
 	c.Assert(err, check.IsNil)
@@ -113,16 +118,17 @@ func (s *DockerSuite) TestStatsAllNewContainersAdded(c *check.C) {
 			switch {
 			case matchID.MatchString(scanner.Text()):
 				close(addedChan)
+				return
 			}
 		}
 	}()
 
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
+	out, _ := runSleepingContainer(c, "-d")
 	c.Assert(waitRun(strings.TrimSpace(out)), check.IsNil)
 	id <- strings.TrimSpace(out)[:12]
 
 	select {
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		c.Fatal("failed to observe new container created added to stats")
 	case <-addedChan:
 		// ignore, done

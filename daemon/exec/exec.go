@@ -1,11 +1,11 @@
 package exec
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/daemon/execdriver"
-	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/runconfig"
 )
@@ -18,7 +18,7 @@ type Config struct {
 	*runconfig.StreamConfig
 	ID            string
 	Running       bool
-	ExitCode      int
+	ExitCode      *int
 	ProcessConfig *execdriver.ProcessConfig
 	OpenStdin     bool
 	OpenStderr    bool
@@ -53,7 +53,13 @@ func NewStore() *Store {
 
 // Commands returns the exec configurations in the store.
 func (e *Store) Commands() map[string]*Config {
-	return e.commands
+	e.RLock()
+	commands := make(map[string]*Config, len(e.commands))
+	for id, config := range e.commands {
+		commands[id] = config
+	}
+	e.RUnlock()
+	return commands
 }
 
 // Add adds a new exec configuration to the store.
@@ -110,7 +116,7 @@ func (c *Config) Resize(h, w int) error {
 	select {
 	case <-c.waitStart:
 	case <-time.After(time.Second):
-		return derr.ErrorCodeExecResize.WithArgs(c.ID)
+		return fmt.Errorf("Exec %s is not running, so it can not be resized.", c.ID)
 	}
 	return c.ProcessConfig.Terminal.Resize(h, w)
 }

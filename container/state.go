@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/daemon/execdriver"
-	derr "github.com/docker/docker/errors"
 	"github.com/docker/go-units"
 )
 
@@ -113,17 +112,17 @@ func wait(waitChan <-chan struct{}, timeout time.Duration) error {
 	}
 	select {
 	case <-time.After(timeout):
-		return derr.ErrorCodeTimedOut.WithArgs(timeout)
+		return fmt.Errorf("Timed out: %v", timeout)
 	case <-waitChan:
 		return nil
 	}
 }
 
-// waitRunning waits until state is running. If state is already
+// WaitRunning waits until state is running. If state is already
 // running it returns immediately. If you want wait forever you must
 // supply negative timeout. Returns pid, that was passed to
 // SetRunning.
-func (s *State) waitRunning(timeout time.Duration) (int, error) {
+func (s *State) WaitRunning(timeout time.Duration) (int, error) {
 	s.Lock()
 	if s.Running {
 		pid := s.Pid
@@ -179,13 +178,6 @@ func (s *State) getExitCode() int {
 	return res
 }
 
-// SetRunningLocking locks container and sets it to "running"
-func (s *State) SetRunningLocking(pid int) {
-	s.Lock()
-	s.SetRunning(pid)
-	s.Unlock()
-}
-
 // SetRunning sets the state of the container to "running".
 func (s *State) SetRunning(pid int) {
 	s.Error = ""
@@ -199,7 +191,7 @@ func (s *State) SetRunning(pid int) {
 	s.waitChan = make(chan struct{})
 }
 
-// SetStoppedLocking locks the container state and sets it to "stopped".
+// SetStoppedLocking locks the container state is sets it to "stopped".
 func (s *State) SetStoppedLocking(exitStatus *execdriver.ExitStatus) {
 	s.Lock()
 	s.SetStopped(exitStatus)
@@ -254,15 +246,24 @@ func (s *State) IsPaused() bool {
 	return res
 }
 
+// IsRestarting returns whether the container is restarting or not.
+func (s *State) IsRestarting() bool {
+	s.Lock()
+	res := s.Restarting
+	s.Unlock()
+	return res
+}
+
 // SetRemovalInProgress sets the container state as being removed.
-func (s *State) SetRemovalInProgress() error {
+// It returns true if the container was already in that state.
+func (s *State) SetRemovalInProgress() bool {
 	s.Lock()
 	defer s.Unlock()
 	if s.RemovalInProgress {
-		return derr.ErrorCodeAlreadyRemoving
+		return true
 	}
 	s.RemovalInProgress = true
-	return nil
+	return false
 }
 
 // ResetRemovalInProgress make the RemovalInProgress state to false.

@@ -325,9 +325,11 @@ func Raw(args ...string) ([]byte, error) {
 		if err == nil || !strings.Contains(err.Error(), "was not provided by any .service files") {
 			return output, err
 		}
-
 	}
+	return raw(args...)
+}
 
+func raw(args ...string) ([]byte, error) {
 	if err := initCheck(); err != nil {
 		return nil, err
 	}
@@ -360,4 +362,21 @@ func RawCombinedOutput(args ...string) error {
 		return fmt.Errorf("%s (%v)", string(output), err)
 	}
 	return nil
+}
+
+// RawCombinedOutputNative behave as RawCombinedOutput with the difference it
+// will always invoke `iptables` binary
+func RawCombinedOutputNative(args ...string) error {
+	if output, err := raw(args...); err != nil || len(output) != 0 {
+		return fmt.Errorf("%s (%v)", string(output), err)
+	}
+	return nil
+}
+
+// ExistChain checks if a chain exists
+func ExistChain(chain string, table Table) bool {
+	if _, err := Raw("-t", string(table), "-L", chain); err == nil {
+		return true
+	}
+	return false
 }

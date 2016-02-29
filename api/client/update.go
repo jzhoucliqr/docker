@@ -6,6 +6,7 @@ import (
 
 	Cli "github.com/docker/docker/cli"
 	flag "github.com/docker/docker/pkg/mflag"
+	"github.com/docker/docker/runconfig/opts"
 	"github.com/docker/engine-api/types/container"
 	"github.com/docker/go-units"
 )
@@ -23,8 +24,9 @@ func (cli *DockerCli) CmdUpdate(args ...string) error {
 	flCPUShares := cmd.Int64([]string{"#c", "-cpu-shares"}, 0, "CPU shares (relative weight)")
 	flMemoryString := cmd.String([]string{"m", "-memory"}, "", "Memory limit")
 	flMemoryReservation := cmd.String([]string{"-memory-reservation"}, "", "Memory soft limit")
-	flMemorySwap := cmd.String([]string{"-memory-swap"}, "", "Total memory (memory + swap), '-1' to disable swap")
+	flMemorySwap := cmd.String([]string{"-memory-swap"}, "", "Swap limit equal to memory plus swap: '-1' to enable unlimited swap")
 	flKernelMemory := cmd.String([]string{"-kernel-memory"}, "", "Kernel memory limit")
+	flRestartPolicy := cmd.String([]string{"-restart"}, "", "Restart policy to apply when a container exits")
 
 	cmd.Require(flag.Min, 1)
 	cmd.ParseFlags(args, true)
@@ -69,6 +71,14 @@ func (cli *DockerCli) CmdUpdate(args ...string) error {
 		}
 	}
 
+	var restartPolicy container.RestartPolicy
+	if *flRestartPolicy != "" {
+		restartPolicy, err = opts.ParseRestartPolicy(*flRestartPolicy)
+		if err != nil {
+			return err
+		}
+	}
+
 	resources := container.Resources{
 		BlkioWeight:       *flBlkioWeight,
 		CpusetCpus:        *flCpusetCpus,
@@ -83,14 +93,15 @@ func (cli *DockerCli) CmdUpdate(args ...string) error {
 	}
 
 	updateConfig := container.UpdateConfig{
-		Resources: resources,
+		Resources:     resources,
+		RestartPolicy: restartPolicy,
 	}
 
 	names := cmd.Args()
 	var errs []string
 	for _, name := range names {
 		if err := cli.client.ContainerUpdate(name, updateConfig); err != nil {
-			errs = append(errs, fmt.Sprintf("Failed to update container (%s): %s", name, err))
+			errs = append(errs, err.Error())
 		} else {
 			fmt.Fprintf(cli.out, "%s\n", name)
 		}

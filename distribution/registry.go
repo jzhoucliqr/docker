@@ -8,36 +8,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution"
-	"github.com/docker/distribution/digest"
-	"github.com/docker/distribution/manifest/schema1"
-	"github.com/docker/distribution/registry/api/errcode"
+	distreference "github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/client"
 	"github.com/docker/distribution/registry/client/auth"
 	"github.com/docker/distribution/registry/client/transport"
-	"github.com/docker/docker/distribution/xfer"
-	"github.com/docker/docker/reference"
+	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/registry"
 	"github.com/docker/engine-api/types"
 	"golang.org/x/net/context"
 )
-
-// fallbackError wraps an error that can possibly allow fallback to a different
-// endpoint.
-type fallbackError struct {
-	// err is the error being wrapped.
-	err error
-	// confirmedV2 is set to true if it was confirmed that the registry
-	// supports the v2 protocol. This is used to limit fallbacks to the v1
-	// protocol.
-	confirmedV2 bool
-}
-
-// Error renders the FallbackError as a string.
-func (f fallbackError) Error() string {
-	return f.err.Error()
-}
 
 type dumbCredentialStore struct {
 	auth *types.AuthConfig
@@ -71,22 +51,26 @@ func NewV2Repository(ctx context.Context, repoInfo *registry.RepositoryInfo, end
 		DisableKeepAlives: true,
 	}
 
-	modifiers := registry.DockerHeaders(metaHeaders)
+	modifiers := registry.DockerHeaders(dockerversion.DockerUserAgent(), metaHeaders)
 	authTransport := transport.NewTransport(base, modifiers...)
 	pingClient := &http.Client{
 		Transport: authTransport,
 		Timeout:   15 * time.Second,
 	}
-	endpointStr := strings.TrimRight(endpoint.URL, "/") + "/v2/"
+	endpointStr := strings.TrimRight(endpoint.URL.String(), "/") + "/v2/"
 	req, err := http.NewRequest("GET", endpointStr, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fallbackError{err: err}
 	}
 	resp, err := pingClient.Do(req)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fallbackError{err: err}
 	}
 	defer resp.Body.Close()
+
+	// We got a HTTP request through, so we're using the right TLS settings.
+	// From this point forward, set transportOK to true in any fallbackError
+	// we return.
 
 	v2Version := auth.APIVersion{
 		Type:    "registry",
@@ -107,7 +91,11 @@ func NewV2Repository(ctx context.Context, repoInfo *registry.RepositoryInfo, end
 
 	challengeManager := auth.NewSimpleChallengeManager()
 	if err := challengeManager.AddResponse(resp); err != nil {
-		return nil, foundVersion, err
+		return nil, foundVersion, fallbackError{
+			err:         err,
+			confirmedV2: foundVersion,
+			transportOK: true,
+		}
 	}
 
 	if authConfig.RegistryToken != "" {
@@ -121,22 +109,24 @@ func NewV2Repository(ctx context.Context, repoInfo *registry.RepositoryInfo, end
 	}
 	tr := transport.NewTransport(base, modifiers...)
 
-	repo, err = client.NewRepository(ctx, repoName, endpoint.URL, tr)
-	return repo, foundVersion, err
-}
+	repoNameRef, err := distreference.ParseNamed(repoName)
+	if err != nil {
+		return nil, foundVersion, fallbackError{
+			err:         err,
+			confirmedV2: foundVersion,
+			transportOK: true,
+		}
+	}
 
-func digestFromManifest(m *schema1.SignedManifest, name reference.Named) (digest.Digest, int, error) {
-	payload, err := m.Payload()
+	repo, err = client.NewRepository(ctx, repoNameRef, endpoint.URL.String(), tr)
 	if err != nil {
-		// If this failed, the signatures section was corrupted
-		// or missing. Treat the entire manifest as the payload.
-		payload = m.Raw
+		err = fallbackError{
+			err:         err,
+			confirmedV2: foundVersion,
+			transportOK: true,
+		}
 	}
-	manifestDigest, err := digest.FromBytes(payload)
-	if err != nil {
-		logrus.Infof("Could not compute manifest digest for %s:%s : %v", name.Name(), m.Tag, err)
-	}
-	return manifestDigest, len(payload), nil
+	return
 }
 
 type existingTokenHandler struct {
@@ -150,25 +140,4 @@ func (th *existingTokenHandler) Scheme() string {
 func (th *existingTokenHandler) AuthorizeRequest(req *http.Request, params map[string]string) error {
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", th.token))
 	return nil
-}
-
-// retryOnError wraps the error in xfer.DoNotRetry if we should not retry the
-// operation after this error.
-func retryOnError(err error) error {
-	switch v := err.(type) {
-	case errcode.Errors:
-		return retryOnError(v[0])
-	case errcode.Error:
-		switch v.Code {
-		case errcode.ErrorCodeUnauthorized, errcode.ErrorCodeUnsupported, errcode.ErrorCodeDenied:
-			return xfer.DoNotRetry{Err: err}
-		}
-	case *client.UnexpectedHTTPResponseError:
-		return xfer.DoNotRetry{Err: err}
-	}
-	// let's be nice and fallback if the error is a completely
-	// unexpected one.
-	// If new errors have to be handled in some way, please
-	// add them to the switch above.
-	return err
 }

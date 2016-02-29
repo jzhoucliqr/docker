@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/datastore"
+	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
 	"github.com/docker/libnetwork/iptables"
 	"github.com/docker/libnetwork/netlabel"
@@ -68,6 +69,7 @@ type networkConfiguration struct {
 	DefaultGatewayIPv6 net.IP
 	dbIndex            uint64
 	dbExists           bool
+	Internal           bool
 }
 
 // endpointConfiguration represents the user specified configuration for the sandbox endpoint
@@ -131,11 +133,11 @@ func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
 	if out, err := exec.Command("modprobe", "-va", "nf_nat").CombinedOutput(); err != nil {
 		logrus.Warnf("Running modprobe nf_nat failed with message: `%s`, error: %v", strings.TrimSpace(string(out)), err)
 	}
+	if out, err := exec.Command("modprobe", "-va", "xt_conntrack").CombinedOutput(); err != nil {
+		logrus.Warnf("Running modprobe xt_conntrack failed with message: `%s`, error: %v", strings.TrimSpace(string(out)), err)
+	}
 	if err := iptables.FirewalldInit(); err != nil {
 		logrus.Debugf("Fail to initialize firewalld: %v, using raw iptables instead", err)
-	}
-	if err := iptables.RemoveExistingChain(DockerChain, iptables.Nat); err != nil {
-		logrus.Warnf("Failed to remove existing iptables entries in %s : %v", DockerChain, err)
 	}
 
 	d := newDriver()
@@ -283,16 +285,25 @@ func (n *bridgeNetwork) getEndpoint(eid string) (*bridgeEndpoint, error) {
 // from each of the other networks
 func (n *bridgeNetwork) isolateNetwork(others []*bridgeNetwork, enable bool) error {
 	n.Lock()
-	thisIface := n.config.BridgeName
+	thisConfig := n.config
 	n.Unlock()
+
+	if thisConfig.Internal {
+		return nil
+	}
 
 	// Install the rules to isolate this networks against each of the other networks
 	for _, o := range others {
 		o.Lock()
-		otherIface := o.config.BridgeName
+		otherConfig := o.config
 		o.Unlock()
-		if thisIface != otherIface {
-			if err := setINC(thisIface, otherIface, enable); err != nil {
+
+		if otherConfig.Internal {
+			continue
+		}
+
+		if thisConfig.BridgeName != otherConfig.BridgeName {
+			if err := setINC(thisConfig.BridgeName, otherConfig.BridgeName, enable); err != nil {
 				return err
 			}
 		}
@@ -371,10 +382,13 @@ func (d *driver) configure(option map[string]interface{}) error {
 	}
 
 	if config.EnableIPTables {
+		removeIPChains()
 		natChain, filterChain, isolationChain, err = setupIPChains(config)
 		if err != nil {
 			return err
 		}
+		// Make sure on firewall reload, first thing being re-played is chains creation
+		iptables.OnReloaded(func() { logrus.Debugf("Recreating iptables chains on firewall reload"); setupIPChains(config) })
 	}
 
 	d.Lock()
@@ -486,7 +500,7 @@ func parseNetworkOptions(id string, option options.Generic) (*networkConfigurati
 
 	if val, ok := option[netlabel.Internal]; ok {
 		if internal, ok := val.(bool); ok && internal {
-			return nil, &driverapi.ErrNotImplemented{}
+			config.Internal = true
 		}
 	}
 
@@ -1275,12 +1289,12 @@ func (d *driver) Type() string {
 }
 
 // DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster
-func (d *driver) DiscoverNew(dType driverapi.DiscoveryType, data interface{}) error {
+func (d *driver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) error {
 	return nil
 }
 
 // DiscoverDelete is a notification for a discovery delete event, such as a node leaving a cluster
-func (d *driver) DiscoverDelete(dType driverapi.DiscoveryType, data interface{}) error {
+func (d *driver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{}) error {
 	return nil
 }
 

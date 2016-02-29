@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/docker/docker/opts"
 	flag "github.com/docker/docker/pkg/mflag"
 	"github.com/docker/docker/pkg/stringid"
+	runconfigopts "github.com/docker/docker/runconfig/opts"
 	"github.com/docker/engine-api/types"
 	"github.com/docker/engine-api/types/filters"
 	"github.com/docker/engine-api/types/network"
@@ -39,12 +41,17 @@ func (cli *DockerCli) CmdNetworkCreate(args ...string) error {
 	flIpamIPRange := opts.NewListOpts(nil)
 	flIpamGateway := opts.NewListOpts(nil)
 	flIpamAux := opts.NewMapOpts(nil, nil)
+	flIpamOpt := opts.NewMapOpts(nil, nil)
 
 	cmd.Var(&flIpamSubnet, []string{"-subnet"}, "subnet in CIDR format that represents a network segment")
 	cmd.Var(&flIpamIPRange, []string{"-ip-range"}, "allocate container ip from a sub-range")
 	cmd.Var(&flIpamGateway, []string{"-gateway"}, "ipv4 or ipv6 Gateway for the master subnet")
 	cmd.Var(flIpamAux, []string{"-aux-address"}, "auxiliary ipv4 or ipv6 addresses used by Network driver")
 	cmd.Var(flOpts, []string{"o", "-opt"}, "set driver specific options")
+	cmd.Var(flIpamOpt, []string{"-ipam-opt"}, "set IPAM driver specific options")
+
+	flInternal := cmd.Bool([]string{"-internal"}, false, "restricts external access to the network")
+	flIPv6 := cmd.Bool([]string{"-ipv6"}, false, "enable IPv6 networking")
 
 	cmd.Require(flag.Exact, 1)
 	err := cmd.ParseFlags(args, true)
@@ -68,9 +75,11 @@ func (cli *DockerCli) CmdNetworkCreate(args ...string) error {
 	nc := types.NetworkCreate{
 		Name:           cmd.Arg(0),
 		Driver:         driver,
-		IPAM:           network.IPAM{Driver: *flIpamDriver, Config: ipamCfg},
+		IPAM:           network.IPAM{Driver: *flIpamDriver, Config: ipamCfg, Options: flIpamOpt.GetAll()},
 		Options:        flOpts.GetAll(),
 		CheckDuplicate: true,
+		Internal:       *flInternal,
+		EnableIPv6:     *flIPv6,
 	}
 
 	resp, err := cli.client.NetworkCreate(nc)
@@ -112,6 +121,10 @@ func (cli *DockerCli) CmdNetworkConnect(args ...string) error {
 	cmd := Cli.Subcmd("network connect", []string{"NETWORK CONTAINER"}, "Connects a container to a network", false)
 	flIPAddress := cmd.String([]string{"-ip"}, "", "IP Address")
 	flIPv6Address := cmd.String([]string{"-ip6"}, "", "IPv6 Address")
+	flLinks := opts.NewListOpts(runconfigopts.ValidateLink)
+	cmd.Var(&flLinks, []string{"-link"}, "Add link to another container")
+	flAliases := opts.NewListOpts(nil)
+	cmd.Var(&flAliases, []string{"-alias"}, "Add network-scoped alias for the container")
 	cmd.Require(flag.Min, 2)
 	if err := cmd.ParseFlags(args, true); err != nil {
 		return err
@@ -121,6 +134,8 @@ func (cli *DockerCli) CmdNetworkConnect(args ...string) error {
 			IPv4Address: *flIPAddress,
 			IPv6Address: *flIPv6Address,
 		},
+		Links:   flLinks.GetAll(),
+		Aliases: flAliases.GetAll(),
 	}
 	return cli.client.NetworkConnect(cmd.Arg(0), cmd.Arg(1), epConfig)
 }
@@ -130,12 +145,13 @@ func (cli *DockerCli) CmdNetworkConnect(args ...string) error {
 // Usage: docker network disconnect <NETWORK> <CONTAINER>
 func (cli *DockerCli) CmdNetworkDisconnect(args ...string) error {
 	cmd := Cli.Subcmd("network disconnect", []string{"NETWORK CONTAINER"}, "Disconnects container from a network", false)
+	force := cmd.Bool([]string{"f", "-force"}, false, "Force the container to disconnect from a network")
 	cmd.Require(flag.Exact, 2)
 	if err := cmd.ParseFlags(args, true); err != nil {
 		return err
 	}
 
-	return cli.client.NetworkDisconnect(cmd.Arg(0), cmd.Arg(1))
+	return cli.client.NetworkDisconnect(cmd.Arg(0), cmd.Arg(1), *force)
 }
 
 // CmdNetworkLs lists all the networks managed by docker daemon
@@ -179,7 +195,7 @@ func (cli *DockerCli) CmdNetworkLs(args ...string) error {
 	if !*quiet {
 		fmt.Fprintln(wr, "NETWORK ID\tNAME\tDRIVER")
 	}
-
+	sort.Sort(byNetworkName(networkResources))
 	for _, networkResource := range networkResources {
 		ID := networkResource.ID
 		netName := networkResource.Name
@@ -200,6 +216,12 @@ func (cli *DockerCli) CmdNetworkLs(args ...string) error {
 	wr.Flush()
 	return nil
 }
+
+type byNetworkName []types.NetworkResource
+
+func (r byNetworkName) Len() int           { return len(r) }
+func (r byNetworkName) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+func (r byNetworkName) Less(i, j int) bool { return r[i].Name < r[j].Name }
 
 // CmdNetworkInspect inspects the network object for more details
 //

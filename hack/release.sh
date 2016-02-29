@@ -81,7 +81,8 @@ setup_s3() {
 	# s3cmd has no useful exit status, so we cannot check that.
 	# Instead, we check if it outputs anything on standard output.
 	# (When there are problems, it uses standard error instead.)
-	s3cmd info "s3://$BUCKET" | grep -q .
+	# NOTE: for some reason on debian:jessie `s3cmd info ... | grep -q .` results in a broken pipe
+	s3cmd info "s3://$BUCKET" | grep . >/dev/null
 	# Make the bucket accessible through website endpoints.
 	s3cmd ws-create --ws-index index --ws-error error "s3://$BUCKET"
 }
@@ -289,7 +290,8 @@ EOF
 # Upload the index script
 release_index() {
 	echo "Releasing index"
-	sed "s,url='https://get.docker.com/',url='$(s3_url)/'," hack/install.sh | write_to_s3 "s3://$BUCKET_PATH/index"
+	url="$(s3_url)/" hack/make.sh install-script
+	write_to_s3 "s3://$BUCKET_PATH/index" < "bundles/$VERSION/install-script/install.sh"
 }
 
 release_test() {

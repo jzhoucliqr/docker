@@ -34,21 +34,13 @@ _space := $(empty) $(empty)
 COVERDIR=.cover
 COVERPROFILE?=$(COVERDIR)/cover.out
 COVERMODE=count
-PKGS = $(shell go list ./... | tr '\n' ' ')
+PKGS ?= $(shell go list ./... | tr '\n' ' ')
 
 GO_VERSION = $(shell go version | awk '{print $$3}')
 
 .PHONY: clean all fmt vet lint build test binaries cross cover docker-images notary-dockerfile
 .DELETE_ON_ERROR: cover
 .DEFAULT: default
-
-go_version:
-ifeq (,$(findstring go1.5.,$(GO_VERSION)))
-	$(error Requires go version 1.5.x - found $(GO_VERSION))
-else
-	@echo
-endif
-
 
 all: AUTHORS clean fmt vet fmt lint build test binaries
 
@@ -71,7 +63,23 @@ ${PREFIX}/bin/notary-signer: NOTARY_VERSION $(shell find . -type f -name '*.go')
 	@echo "+ $@"
 	@godep go build -tags ${NOTARY_BUILDTAGS} -o $@ ${GO_LDFLAGS} ./cmd/notary-signer
 
-vet: go_version
+ifeq ($(shell uname -s),Darwin)
+${PREFIX}/bin/static/notary-server:
+	@echo "notary-server: static builds not supported on OS X"
+
+${PREFIX}/bin/static/notary-signer:
+	@echo "notary-signer: static builds not supported on OS X"
+else
+${PREFIX}/bin/static/notary-server: NOTARY_VERSION $(shell find . -type f -name '*.go')
+	@echo "+ $@"
+	@godep go build -tags ${NOTARY_BUILDTAGS} -o $@ ${GO_LDFLAGS_STATIC} ./cmd/notary-server
+
+${PREFIX}/bin/static/notary-signer: NOTARY_VERSION $(shell find . -type f -name '*.go')
+	@echo "+ $@"
+	@godep go build -tags ${NOTARY_BUILDTAGS} -o $@ ${GO_LDFLAGS_STATIC} ./cmd/notary-signer
+endif
+
+vet: 
 	@echo "+ $@"
 ifeq ($(shell uname -s), Darwin)
 	@test -z "$(shell find . -iname *test*.go | grep -v _test.go | grep -v Godeps | xargs echo "This file should end with '_test':"  | tee /dev/stderr)"
@@ -88,18 +96,35 @@ lint:
 	@echo "+ $@"
 	@test -z "$$(golint ./... | grep -v .pb. | grep -v Godeps/_workspace/src/ | tee /dev/stderr)"
 
-build: go_version
+# Requires that the following:
+# go get -u github.com/client9/misspell/cmd/misspell
+#
+# be run first
+
+# misspell target, don't include Godeps, binaries, python tests, or git files
+misspell:
+	@echo "+ $@"
+	@test -z "$$(find . -name '*' | grep -v Godeps/_workspace/src/ | grep -v bin/ | grep -v misc/ | grep -v .git/ | xargs misspell | tee /dev/stderr)"
+
+build:
 	@echo "+ $@"
 	@go build -tags "${NOTARY_BUILDTAGS}" -v ${GO_LDFLAGS} ./...
 
+# When running `go test ./...`, it runs all the suites in parallel, which causes
+# problems when running with a yubikey
 test: TESTOPTS =
-test: go_version
+test: 
+	@echo Note: when testing with a yubikey plugged in, make sure to include 'TESTOPTS="-p 1"'
 	@echo "+ $@ $(TESTOPTS)"
+	@echo
 	go test -tags "${NOTARY_BUILDTAGS}" $(TESTOPTS) ./...
 
+test-full: TESTOPTS =
 test-full: vet lint
+	@echo Note: when testing with a yubikey plugged in, make sure to include 'TESTOPTS="-p 1"'
 	@echo "+ $@"
-	go test -tags "${NOTARY_BUILDTAGS}" -v ./...
+	@echo
+	go test -tags "${NOTARY_BUILDTAGS}" $(TESTOPTS) -v ./...
 
 protos:
 	@protoc --go_out=plugins=grpc:. proto/*.proto
@@ -111,22 +136,30 @@ protos:
 # be run first
 
 define gocover
-$(GO_EXC) test $(OPTS) $(TESTOPTS) -covermode="$(COVERMODE)" -coverprofile="$(COVERDIR)/$(subst /,-,$(1)).$(subst $(_space),.,$(NOTARY_BUILDTAGS)).cover" "$(1)" || exit 1;
+$(GO_EXC) test $(OPTS) $(TESTOPTS) -covermode="$(COVERMODE)" -coverprofile="$(COVERDIR)/$(subst /,-,$(1)).$(subst $(_space),.,$(NOTARY_BUILDTAGS)).coverage.txt" "$(1)" || exit 1;
 endef
 
-gen-cover: go_version
+gen-cover: 
 	@mkdir -p "$(COVERDIR)"
 	$(foreach PKG,$(PKGS),$(call gocover,$(PKG)))
+	rm -f "$(COVERDIR)"/*testutils*.coverage.txt
 
+# Generates the cover binaries and runs them all in serial, so this can be used
+# run all tests with a yubikey without any problems
 cover: GO_EXC := go
        OPTS = -tags "${NOTARY_BUILDTAGS}" -coverpkg "$(shell ./coverpkg.sh $(1) $(NOTARY_PKG))"
 cover: gen-cover covmerge
 	@go tool cover -html="$(COVERPROFILE)"
 
-# Codecov knows how to merge multiple coverage files
+# Generates the cover binaries and runs them all in serial, so this can be used
+# run all tests with a yubikey without any problems
 ci: OPTS = -tags "${NOTARY_BUILDTAGS}" -race -coverpkg "$(shell ./coverpkg.sh $(1) $(NOTARY_PKG))"
     GO_EXC := godep go
+# Codecov knows how to merge multiple coverage files, so covmerge is not needed
 ci: gen-cover
+
+yubikey-tests: override PKGS = github.com/docker/notary/cmd/notary github.com/docker/notary/trustmanager/yubikey
+yubikey-tests: ci
 
 covmerge:
 	@gocovmerge $(shell ls -1 $(COVERDIR)/* | tr "\n" " ") > $(COVERPROFILE)
@@ -135,7 +168,10 @@ covmerge:
 clean-protos:
 	@rm proto/*.pb.go
 
-binaries: go_version ${PREFIX}/bin/notary-server ${PREFIX}/bin/notary ${PREFIX}/bin/notary-signer
+binaries: ${PREFIX}/bin/notary-server ${PREFIX}/bin/notary ${PREFIX}/bin/notary-signer
+	@echo "+ $@"
+
+static: ${PREFIX}/bin/static/notary-server ${PREFIX}/bin/static/notary-signer
 	@echo "+ $@"
 
 define template
@@ -143,7 +179,7 @@ mkdir -p ${PREFIX}/cross/$(1)/$(2);
 GOOS=$(1) GOARCH=$(2) CGO_ENABLED=0 go build -o ${PREFIX}/cross/$(1)/$(2)/notary -a -tags "static_build netgo" -installsuffix netgo ${GO_LDFLAGS_STATIC} ./cmd/notary;
 endef
 
-cross: go_version
+cross: 
 	$(foreach GOARCH,$(GOARCHS),$(foreach GOOS,$(GOOSES),$(call template,$(GOOS),$(GOARCH))))
 
 
@@ -151,10 +187,10 @@ notary-dockerfile:
 	@docker build --rm --force-rm -t notary .
 
 server-dockerfile:
-	@docker build --rm --force-rm -f Dockerfile.server -t notary-server .
+	@docker build --rm --force-rm -f server.Dockerfile -t notary-server .
 
 signer-dockerfile:
-	@docker build --rm --force-rm -f Dockerfile.signer -t notary-signer .
+	@docker build --rm --force-rm -f signer.Dockerfile -t notary-signer .
 
 docker-images: notary-dockerfile server-dockerfile signer-dockerfile
 

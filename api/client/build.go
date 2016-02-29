@@ -6,22 +6,20 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strings"
+
+	"golang.org/x/net/context"
 
 	"github.com/docker/docker/api"
+	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/dockerignore"
 	Cli "github.com/docker/docker/cli"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/fileutils"
-	"github.com/docker/docker/pkg/gitutils"
-	"github.com/docker/docker/pkg/httputils"
 	"github.com/docker/docker/pkg/jsonmessage"
 	flag "github.com/docker/docker/pkg/mflag"
 	"github.com/docker/docker/pkg/progress"
@@ -33,6 +31,8 @@ import (
 	"github.com/docker/engine-api/types/container"
 	"github.com/docker/go-units"
 )
+
+type translatorFunc func(reference.NamedTagged) (reference.Canonical, error)
 
 // CmdBuild builds a new image from the source code at a given path.
 //
@@ -60,7 +60,7 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 	flCgroupParent := cmd.String([]string{"-cgroup-parent"}, "", "Optional parent cgroup for the container")
 	flBuildArg := opts.NewListOpts(runconfigopts.ValidateEnv)
 	cmd.Var(&flBuildArg, []string{"-build-arg"}, "Set build-time variables")
-	isolation := cmd.String([]string{"-isolation"}, "", "Container isolation level")
+	isolation := cmd.String([]string{"-isolation"}, "", "Container isolation technology")
 
 	ulimits := make(map[string]*units.Ulimit)
 	flUlimits := runconfigopts.NewUlimitOpt(&ulimits)
@@ -74,13 +74,9 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 	cmd.ParseFlags(args, true)
 
 	var (
-		context  io.ReadCloser
-		isRemote bool
-		err      error
+		ctx io.ReadCloser
+		err error
 	)
-
-	_, err = exec.LookPath("git")
-	hasGit := err == nil
 
 	specifiedContext := cmd.Arg(0)
 
@@ -101,13 +97,13 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 
 	switch {
 	case specifiedContext == "-":
-		tempDir, relDockerfile, err = getContextFromReader(cli.in, *dockerfileName)
-	case urlutil.IsGitURL(specifiedContext) && hasGit:
-		tempDir, relDockerfile, err = getContextFromGitURL(specifiedContext, *dockerfileName)
+		ctx, relDockerfile, err = builder.GetContextFromReader(cli.in, *dockerfileName)
+	case urlutil.IsGitURL(specifiedContext):
+		tempDir, relDockerfile, err = builder.GetContextFromGitURL(specifiedContext, *dockerfileName)
 	case urlutil.IsURL(specifiedContext):
-		tempDir, relDockerfile, err = getContextFromURL(progBuff, specifiedContext, *dockerfileName)
+		ctx, relDockerfile, err = builder.GetContextFromURL(progBuff, specifiedContext, *dockerfileName)
 	default:
-		contextDir, relDockerfile, err = getContextFromLocalDir(specifiedContext, *dockerfileName)
+		contextDir, relDockerfile, err = builder.GetContextFromLocalDir(specifiedContext, *dockerfileName)
 	}
 
 	if err != nil {
@@ -122,73 +118,65 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 		contextDir = tempDir
 	}
 
-	// And canonicalize dockerfile name to a platform-independent one
-	relDockerfile, err = archive.CanonicalTarNameForPath(relDockerfile)
-	if err != nil {
-		return fmt.Errorf("cannot canonicalize dockerfile path %s: %v", relDockerfile, err)
-	}
+	if ctx == nil {
+		// And canonicalize dockerfile name to a platform-independent one
+		relDockerfile, err = archive.CanonicalTarNameForPath(relDockerfile)
+		if err != nil {
+			return fmt.Errorf("cannot canonicalize dockerfile path %s: %v", relDockerfile, err)
+		}
 
-	f, err := os.Open(filepath.Join(contextDir, ".dockerignore"))
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
+		f, err := os.Open(filepath.Join(contextDir, ".dockerignore"))
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
 
-	var excludes []string
-	if err == nil {
-		excludes, err = dockerignore.ReadAll(f)
+		var excludes []string
+		if err == nil {
+			excludes, err = dockerignore.ReadAll(f)
+			if err != nil {
+				return err
+			}
+		}
+
+		if err := builder.ValidateContextDirectory(contextDir, excludes); err != nil {
+			return fmt.Errorf("Error checking context: '%s'.", err)
+		}
+
+		// If .dockerignore mentions .dockerignore or the Dockerfile
+		// then make sure we send both files over to the daemon
+		// because Dockerfile is, obviously, needed no matter what, and
+		// .dockerignore is needed to know if either one needs to be
+		// removed. The daemon will remove them for us, if needed, after it
+		// parses the Dockerfile. Ignore errors here, as they will have been
+		// caught by validateContextDirectory above.
+		var includes = []string{"."}
+		keepThem1, _ := fileutils.Matches(".dockerignore", excludes)
+		keepThem2, _ := fileutils.Matches(relDockerfile, excludes)
+		if keepThem1 || keepThem2 {
+			includes = append(includes, ".dockerignore", relDockerfile)
+		}
+
+		ctx, err = archive.TarWithOptions(contextDir, &archive.TarOptions{
+			Compression:     archive.Uncompressed,
+			ExcludePatterns: excludes,
+			IncludeFiles:    includes,
+		})
 		if err != nil {
 			return err
 		}
 	}
 
-	if err := validateContextDirectory(contextDir, excludes); err != nil {
-		return fmt.Errorf("Error checking context: '%s'.", err)
-	}
-
-	// If .dockerignore mentions .dockerignore or the Dockerfile
-	// then make sure we send both files over to the daemon
-	// because Dockerfile is, obviously, needed no matter what, and
-	// .dockerignore is needed to know if either one needs to be
-	// removed. The daemon will remove them for us, if needed, after it
-	// parses the Dockerfile. Ignore errors here, as they will have been
-	// caught by validateContextDirectory above.
-	var includes = []string{"."}
-	keepThem1, _ := fileutils.Matches(".dockerignore", excludes)
-	keepThem2, _ := fileutils.Matches(relDockerfile, excludes)
-	if keepThem1 || keepThem2 {
-		includes = append(includes, ".dockerignore", relDockerfile)
-	}
-
-	context, err = archive.TarWithOptions(contextDir, &archive.TarOptions{
-		Compression:     archive.Uncompressed,
-		ExcludePatterns: excludes,
-		IncludeFiles:    includes,
-	})
-	if err != nil {
-		return err
-	}
-
 	var resolvedTags []*resolvedTag
 	if isTrusted() {
-		// Resolve the FROM lines in the Dockerfile to trusted digest references
-		// using Notary. On a successful build, we must tag the resolved digests
-		// to the original name specified in the Dockerfile.
-		var newDockerfile *trustedDockerfile
-		newDockerfile, resolvedTags, err = rewriteDockerfileFrom(filepath.Join(contextDir, relDockerfile), cli.trustedReference)
-		if err != nil {
-			return fmt.Errorf("unable to process Dockerfile: %v", err)
-		}
-		defer newDockerfile.Close()
-
 		// Wrap the tar archive to replace the Dockerfile entry with the rewritten
 		// Dockerfile which uses trusted pulls.
-		context = replaceDockerfileTarWrapper(context, newDockerfile, relDockerfile)
+		ctx = replaceDockerfileTarWrapper(ctx, relDockerfile, cli.trustedReference, &resolvedTags)
 	}
 
 	// Setup an upload progress bar
 	progressOutput := streamformatter.NewStreamFormatter().NewProgressOutput(progBuff, true)
 
-	var body io.Reader = progress.NewProgressReader(context, progressOutput, 0, "", "Sending build context to Docker daemon")
+	var body io.Reader = progress.NewProgressReader(ctx, progressOutput, 0, "", "Sending build context to Docker daemon")
 
 	var memory int64
 	if *flMemoryString != "" {
@@ -220,23 +208,17 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 		}
 	}
 
-	var remoteContext string
-	if isRemote {
-		remoteContext = cmd.Arg(0)
-	}
-
 	options := types.ImageBuildOptions{
 		Context:        body,
 		Memory:         memory,
 		MemorySwap:     memorySwap,
 		Tags:           flTags.GetAll(),
 		SuppressOutput: *suppressOutput,
-		RemoteContext:  remoteContext,
 		NoCache:        *noCache,
 		Remove:         *rm,
 		ForceRemove:    *forceRm,
 		PullParent:     *pull,
-		IsolationLevel: container.IsolationLevel(*isolation),
+		Isolation:      container.Isolation(*isolation),
 		CPUSetCPUs:     *flCPUSetCpus,
 		CPUSetMems:     *flCPUSetMems,
 		CPUShares:      *flCPUShares,
@@ -250,7 +232,7 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 		AuthConfigs:    cli.configFile.AuthConfigs,
 	}
 
-	response, err := cli.client.ImageBuild(options)
+	response, err := cli.client.ImageBuild(context.Background(), options)
 	if err != nil {
 		return err
 	}
@@ -294,54 +276,6 @@ func (cli *DockerCli) CmdBuild(args ...string) error {
 	return nil
 }
 
-// validateContextDirectory checks if all the contents of the directory
-// can be read and returns an error if some files can't be read
-// symlinks which point to non-existing files don't trigger an error
-func validateContextDirectory(srcPath string, excludes []string) error {
-	contextRoot, err := getContextRoot(srcPath)
-	if err != nil {
-		return err
-	}
-	return filepath.Walk(contextRoot, func(filePath string, f os.FileInfo, err error) error {
-		// skip this directory/file if it's not in the path, it won't get added to the context
-		if relFilePath, err := filepath.Rel(contextRoot, filePath); err != nil {
-			return err
-		} else if skip, err := fileutils.Matches(relFilePath, excludes); err != nil {
-			return err
-		} else if skip {
-			if f.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if err != nil {
-			if os.IsPermission(err) {
-				return fmt.Errorf("can't stat '%s'", filePath)
-			}
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-
-		// skip checking if symlinks point to non-existing files, such symlinks can be useful
-		// also skip named pipes, because they hanging on open
-		if f.Mode()&(os.ModeSymlink|os.ModeNamedPipe) != 0 {
-			return nil
-		}
-
-		if !f.IsDir() {
-			currentFile, err := os.Open(filePath)
-			if err != nil && os.IsPermission(err) {
-				return fmt.Errorf("no permission to read from '%s'", filePath)
-			}
-			currentFile.Close()
-		}
-		return nil
-	})
-}
-
 // validateTag checks if the given image name can be resolved.
 func validateTag(rawRepo string) (string, error) {
 	_, err := reference.ParseNamed(rawRepo)
@@ -350,96 +284,6 @@ func validateTag(rawRepo string) (string, error) {
 	}
 
 	return rawRepo, nil
-}
-
-// isUNC returns true if the path is UNC (one starting \\). It always returns
-// false on Linux.
-func isUNC(path string) bool {
-	return runtime.GOOS == "windows" && strings.HasPrefix(path, `\\`)
-}
-
-// getDockerfileRelPath uses the given context directory for a `docker build`
-// and returns the absolute path to the context directory, the relative path of
-// the dockerfile in that context directory, and a non-nil error on success.
-func getDockerfileRelPath(givenContextDir, givenDockerfile string) (absContextDir, relDockerfile string, err error) {
-	if absContextDir, err = filepath.Abs(givenContextDir); err != nil {
-		return "", "", fmt.Errorf("unable to get absolute context directory: %v", err)
-	}
-
-	// The context dir might be a symbolic link, so follow it to the actual
-	// target directory.
-	//
-	// FIXME. We use isUNC (always false on non-Windows platforms) to workaround
-	// an issue in golang. On Windows, EvalSymLinks does not work on UNC file
-	// paths (those starting with \\). This hack means that when using links
-	// on UNC paths, they will not be followed.
-	if !isUNC(absContextDir) {
-		absContextDir, err = filepath.EvalSymlinks(absContextDir)
-		if err != nil {
-			return "", "", fmt.Errorf("unable to evaluate symlinks in context path: %v", err)
-		}
-	}
-
-	stat, err := os.Lstat(absContextDir)
-	if err != nil {
-		return "", "", fmt.Errorf("unable to stat context directory %q: %v", absContextDir, err)
-	}
-
-	if !stat.IsDir() {
-		return "", "", fmt.Errorf("context must be a directory: %s", absContextDir)
-	}
-
-	absDockerfile := givenDockerfile
-	if absDockerfile == "" {
-		// No -f/--file was specified so use the default relative to the
-		// context directory.
-		absDockerfile = filepath.Join(absContextDir, api.DefaultDockerfileName)
-
-		// Just to be nice ;-) look for 'dockerfile' too but only
-		// use it if we found it, otherwise ignore this check
-		if _, err = os.Lstat(absDockerfile); os.IsNotExist(err) {
-			altPath := filepath.Join(absContextDir, strings.ToLower(api.DefaultDockerfileName))
-			if _, err = os.Lstat(altPath); err == nil {
-				absDockerfile = altPath
-			}
-		}
-	}
-
-	// If not already an absolute path, the Dockerfile path should be joined to
-	// the base directory.
-	if !filepath.IsAbs(absDockerfile) {
-		absDockerfile = filepath.Join(absContextDir, absDockerfile)
-	}
-
-	// Evaluate symlinks in the path to the Dockerfile too.
-	//
-	// FIXME. We use isUNC (always false on non-Windows platforms) to workaround
-	// an issue in golang. On Windows, EvalSymLinks does not work on UNC file
-	// paths (those starting with \\). This hack means that when using links
-	// on UNC paths, they will not be followed.
-	if !isUNC(absDockerfile) {
-		absDockerfile, err = filepath.EvalSymlinks(absDockerfile)
-		if err != nil {
-			return "", "", fmt.Errorf("unable to evaluate symlinks in Dockerfile path: %v", err)
-		}
-	}
-
-	if _, err := os.Lstat(absDockerfile); err != nil {
-		if os.IsNotExist(err) {
-			return "", "", fmt.Errorf("Cannot locate Dockerfile: %q", absDockerfile)
-		}
-		return "", "", fmt.Errorf("unable to stat Dockerfile: %v", err)
-	}
-
-	if relDockerfile, err = filepath.Rel(absContextDir, absDockerfile); err != nil {
-		return "", "", fmt.Errorf("unable to get relative Dockerfile path: %v", err)
-	}
-
-	if strings.HasPrefix(relDockerfile, ".."+string(filepath.Separator)) {
-		return "", "", fmt.Errorf("The Dockerfile (%s) must be within the build context (%s)", givenDockerfile, givenContextDir)
-	}
-
-	return absContextDir, relDockerfile, nil
 }
 
 // writeToFile copies from the given reader and writes it to a file with the
@@ -458,105 +302,7 @@ func writeToFile(r io.Reader, filename string) error {
 	return nil
 }
 
-// getContextFromReader will read the contents of the given reader as either a
-// Dockerfile or tar archive to be extracted to a temporary directory used as
-// the context directory. Returns the absolute path to the temporary context
-// directory, the relative path of the dockerfile in that context directory,
-// and a non-nil error on success.
-func getContextFromReader(r io.Reader, dockerfileName string) (absContextDir, relDockerfile string, err error) {
-	buf := bufio.NewReader(r)
-
-	magic, err := buf.Peek(archive.HeaderSize)
-	if err != nil && err != io.EOF {
-		return "", "", fmt.Errorf("failed to peek context header from STDIN: %v", err)
-	}
-
-	if absContextDir, err = ioutil.TempDir("", "docker-build-context-"); err != nil {
-		return "", "", fmt.Errorf("unbale to create temporary context directory: %v", err)
-	}
-
-	defer func(d string) {
-		if err != nil {
-			os.RemoveAll(d)
-		}
-	}(absContextDir)
-
-	if !archive.IsArchive(magic) { // Input should be read as a Dockerfile.
-		// -f option has no meaning when we're reading it from stdin,
-		// so just use our default Dockerfile name
-		relDockerfile = api.DefaultDockerfileName
-
-		return absContextDir, relDockerfile, writeToFile(buf, filepath.Join(absContextDir, relDockerfile))
-	}
-
-	if err := archive.Untar(buf, absContextDir, nil); err != nil {
-		return "", "", fmt.Errorf("unable to extract stdin to temporary context directory: %v", err)
-	}
-
-	return getDockerfileRelPath(absContextDir, dockerfileName)
-}
-
-// getContextFromGitURL uses a Git URL as context for a `docker build`. The
-// git repo is cloned into a temporary directory used as the context directory.
-// Returns the absolute path to the temporary context directory, the relative
-// path of the dockerfile in that context directory, and a non-nil error on
-// success.
-func getContextFromGitURL(gitURL, dockerfileName string) (absContextDir, relDockerfile string, err error) {
-	if absContextDir, err = gitutils.Clone(gitURL); err != nil {
-		return "", "", fmt.Errorf("unable to 'git clone' to temporary context directory: %v", err)
-	}
-
-	return getDockerfileRelPath(absContextDir, dockerfileName)
-}
-
-// getContextFromURL uses a remote URL as context for a `docker build`. The
-// remote resource is downloaded as either a Dockerfile or a context tar
-// archive and stored in a temporary directory used as the context directory.
-// Returns the absolute path to the temporary context directory, the relative
-// path of the dockerfile in that context directory, and a non-nil error on
-// success.
-func getContextFromURL(out io.Writer, remoteURL, dockerfileName string) (absContextDir, relDockerfile string, err error) {
-	response, err := httputils.Download(remoteURL)
-	if err != nil {
-		return "", "", fmt.Errorf("unable to download remote context %s: %v", remoteURL, err)
-	}
-	defer response.Body.Close()
-	progressOutput := streamformatter.NewStreamFormatter().NewProgressOutput(out, true)
-
-	// Pass the response body through a progress reader.
-	progReader := progress.NewProgressReader(response.Body, progressOutput, response.ContentLength, "", fmt.Sprintf("Downloading build context from remote url: %s", remoteURL))
-
-	return getContextFromReader(progReader, dockerfileName)
-}
-
-// getContextFromLocalDir uses the given local directory as context for a
-// `docker build`. Returns the absolute path to the local context directory,
-// the relative path of the dockerfile in that context directory, and a non-nil
-// error on success.
-func getContextFromLocalDir(localDir, dockerfileName string) (absContextDir, relDockerfile string, err error) {
-	// When using a local context directory, when the Dockerfile is specified
-	// with the `-f/--file` option then it is considered relative to the
-	// current directory and not the context directory.
-	if dockerfileName != "" {
-		if dockerfileName, err = filepath.Abs(dockerfileName); err != nil {
-			return "", "", fmt.Errorf("unable to get absolute path to Dockerfile: %v", err)
-		}
-	}
-
-	return getDockerfileRelPath(localDir, dockerfileName)
-}
-
 var dockerfileFromLinePattern = regexp.MustCompile(`(?i)^[\s]*FROM[ \f\r\t\v]+(?P<image>[^ \f\r\t\v\n#]+)`)
-
-type trustedDockerfile struct {
-	*os.File
-	size int64
-}
-
-func (td *trustedDockerfile) Close() error {
-	td.File.Close()
-	return os.Remove(td.File.Name())
-}
 
 // resolvedTag records the repository, tag, and resolved digest reference
 // from a Dockerfile rewrite.
@@ -569,32 +315,9 @@ type resolvedTag struct {
 // "FROM <image>" instructions to a digest reference. `translator` is a
 // function that takes a repository name and tag reference and returns a
 // trusted digest reference.
-func rewriteDockerfileFrom(dockerfileName string, translator func(reference.NamedTagged) (reference.Canonical, error)) (newDockerfile *trustedDockerfile, resolvedTags []*resolvedTag, err error) {
-	dockerfile, err := os.Open(dockerfileName)
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to open Dockerfile: %v", err)
-	}
-	defer dockerfile.Close()
-
+func rewriteDockerfileFrom(dockerfile io.Reader, translator translatorFunc) (newDockerfile []byte, resolvedTags []*resolvedTag, err error) {
 	scanner := bufio.NewScanner(dockerfile)
-
-	// Make a tempfile to store the rewritten Dockerfile.
-	tempFile, err := ioutil.TempFile("", "trusted-dockerfile-")
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to make temporary trusted Dockerfile: %v", err)
-	}
-
-	trustedFile := &trustedDockerfile{
-		File: tempFile,
-	}
-
-	defer func() {
-		if err != nil {
-			// Close the tempfile if there was an error during Notary lookups.
-			// Otherwise the caller should close it.
-			trustedFile.Close()
-		}
-	}()
+	buf := bytes.NewBuffer(nil)
 
 	// Scan the lines of the Dockerfile, looking for a "FROM" line.
 	for scanner.Scan() {
@@ -622,26 +345,21 @@ func rewriteDockerfileFrom(dockerfileName string, translator func(reference.Name
 			}
 		}
 
-		n, err := fmt.Fprintln(tempFile, line)
+		_, err := fmt.Fprintln(buf, line)
 		if err != nil {
 			return nil, nil, err
 		}
-
-		trustedFile.size += int64(n)
 	}
 
-	tempFile.Seek(0, os.SEEK_SET)
-
-	return trustedFile, resolvedTags, scanner.Err()
+	return buf.Bytes(), resolvedTags, scanner.Err()
 }
 
 // replaceDockerfileTarWrapper wraps the given input tar archive stream and
 // replaces the entry with the given Dockerfile name with the contents of the
 // new Dockerfile. Returns a new tar archive stream with the replaced
 // Dockerfile.
-func replaceDockerfileTarWrapper(inputTarStream io.ReadCloser, newDockerfile *trustedDockerfile, dockerfileName string) io.ReadCloser {
+func replaceDockerfileTarWrapper(inputTarStream io.ReadCloser, dockerfileName string, translator translatorFunc, resolvedTags *[]*resolvedTag) io.ReadCloser {
 	pipeReader, pipeWriter := io.Pipe()
-
 	go func() {
 		tarReader := tar.NewReader(inputTarStream)
 		tarWriter := tar.NewWriter(pipeWriter)
@@ -662,13 +380,18 @@ func replaceDockerfileTarWrapper(inputTarStream io.ReadCloser, newDockerfile *tr
 			}
 
 			var content io.Reader = tarReader
-
 			if hdr.Name == dockerfileName {
 				// This entry is the Dockerfile. Since the tar archive was
 				// generated from a directory on the local filesystem, the
 				// Dockerfile will only appear once in the archive.
-				hdr.Size = newDockerfile.size
-				content = newDockerfile
+				var newDockerfile []byte
+				newDockerfile, *resolvedTags, err = rewriteDockerfileFrom(content, translator)
+				if err != nil {
+					pipeWriter.CloseWithError(err)
+					return
+				}
+				hdr.Size = int64(len(newDockerfile))
+				content = bytes.NewBuffer(newDockerfile)
 			}
 
 			if err := tarWriter.WriteHeader(hdr); err != nil {

@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"fmt"
+	"net/http"
 	"runtime"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/container"
-	derr "github.com/docker/docker/errors"
+	"github.com/docker/docker/errors"
 	"github.com/docker/docker/runconfig"
 	containertypes "github.com/docker/engine-api/types/container"
 )
@@ -18,11 +20,12 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 	}
 
 	if container.IsPaused() {
-		return derr.ErrorCodeStartPaused
+		return fmt.Errorf("Cannot start a paused container, try unpause instead.")
 	}
 
 	if container.IsRunning() {
-		return derr.ErrorCodeAlreadyStarted
+		err := fmt.Errorf("Container already started")
+		return errors.NewErrorWithStatusCode(err, http.StatusNotModified)
 	}
 
 	// Windows does not have the backwards compatibility issue here.
@@ -31,23 +34,33 @@ func (daemon *Daemon) ContainerStart(name string, hostConfig *containertypes.Hos
 		// creating a container, not during start.
 		if hostConfig != nil {
 			logrus.Warn("DEPRECATED: Setting host configuration options when the container starts is deprecated and will be removed in Docker 1.12")
+			oldNetworkMode := container.HostConfig.NetworkMode
 			if err := daemon.setSecurityOptions(container, hostConfig); err != nil {
 				return err
 			}
 			if err := daemon.setHostConfig(container, hostConfig); err != nil {
 				return err
 			}
+			newNetworkMode := container.HostConfig.NetworkMode
+			if string(oldNetworkMode) != string(newNetworkMode) {
+				// if user has change the network mode on starting, clean up the
+				// old networks. It is a deprecated feature and will be removed in Docker 1.12
+				container.NetworkSettings.Networks = nil
+				if err := container.ToDisk(); err != nil {
+					return err
+				}
+			}
 			container.InitDNSHostConfig()
 		}
 	} else {
 		if hostConfig != nil {
-			return derr.ErrorCodeHostConfigStart
+			return fmt.Errorf("Supplying a hostconfig on start is not supported. It should be supplied on create")
 		}
 	}
 
 	// check if hostConfig is in line with the current system settings.
 	// It may happen cgroups are umounted or the like.
-	if _, err = daemon.verifyContainerSettings(container.HostConfig, nil); err != nil {
+	if _, err = daemon.verifyContainerSettings(container.HostConfig, nil, false); err != nil {
 		return err
 	}
 	// Adapt for old containers in case we have updates in this function and
@@ -77,7 +90,7 @@ func (daemon *Daemon) containerStart(container *container.Container) (err error)
 	}
 
 	if container.RemovalInProgress || container.Dead {
-		return derr.ErrorCodeContainerBeingRemoved
+		return fmt.Errorf("Container is marked for removal and cannot be started.")
 	}
 
 	// if we encounter an error during start we need to ensure that any other
@@ -91,7 +104,10 @@ func (daemon *Daemon) containerStart(container *container.Container) (err error)
 			}
 			container.ToDisk()
 			daemon.Cleanup(container)
-			daemon.LogContainerEvent(container, "die")
+			attributes := map[string]string{
+				"exitCode": fmt.Sprintf("%d", container.ExitCode),
+			}
+			daemon.LogContainerEventWithAttributes(container, "die", attributes)
 		}
 	}()
 
@@ -132,21 +148,15 @@ func (daemon *Daemon) containerStart(container *container.Container) (err error)
 	mounts = append(mounts, container.TmpfsMounts()...)
 
 	container.Command.Mounts = mounts
-	container.Unlock()
-
-	// don't lock waitForStart because it has potential risk of blocking
-	// which will lead to dead lock, forever.
 	if err := daemon.waitForStart(container); err != nil {
-		container.Lock()
 		return err
 	}
-	container.Lock()
 	container.HasBeenStartedBefore = true
 	return nil
 }
 
 func (daemon *Daemon) waitForStart(container *container.Container) error {
-	return container.StartMonitor(daemon, container.HostConfig.RestartPolicy)
+	return container.StartMonitor(daemon)
 }
 
 // Cleanup releases any network resources allocated to the container along with any rules

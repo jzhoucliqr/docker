@@ -11,10 +11,12 @@ import (
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/cli"
 	"github.com/docker/docker/cliconfig"
+	"github.com/docker/docker/cliconfig/credentials"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/term"
 	"github.com/docker/engine-api/client"
+	"github.com/docker/go-connections/sockets"
 	"github.com/docker/go-connections/tlsconfig"
 )
 
@@ -44,6 +46,8 @@ type DockerCli struct {
 	isTerminalOut bool
 	// client is the http client that performs all API operations
 	client client.APIClient
+	// state holds the terminal state
+	state *term.State
 }
 
 // Initialize calls the init function that will setup the configuration for the client
@@ -79,6 +83,31 @@ func (cli *DockerCli) ImagesFormat() string {
 	return cli.configFile.ImagesFormat
 }
 
+func (cli *DockerCli) setRawTerminal() error {
+	if cli.isTerminalIn && os.Getenv("NORAW") == "" {
+		state, err := term.SetRawTerminal(cli.inFd)
+		if err != nil {
+			return err
+		}
+		cli.state = state
+	}
+	return nil
+}
+
+func (cli *DockerCli) restoreTerminal(in io.Closer) error {
+	if cli.state != nil {
+		term.RestoreTerminal(cli.inFd, cli.state)
+	}
+	// WARNING: DO NOT REMOVE THE OS CHECK !!!
+	// For some reason this Close call blocks on darwin..
+	// As the client exists right after, simply discard the close
+	// until we find a better solution.
+	if in != nil && runtime.GOOS != "darwin" {
+		return in.Close()
+	}
+	return nil
+}
+
 // NewDockerCli returns a DockerCli instance with IO output and error streams set by in, out and err.
 // The key file, protocol (i.e. unix) and address are passed in as strings, along with the tls.Config. If the tls.Config
 // is set the client scheme will be set to https.
@@ -96,6 +125,9 @@ func NewDockerCli(in io.ReadCloser, out, err io.Writer, clientFlags *cli.ClientF
 		configFile, e := cliconfig.Load(cliconfig.ConfigDir())
 		if e != nil {
 			fmt.Fprintf(cli.err, "WARNING: Error loading config file:%v\n", e)
+		}
+		if !configFile.ContainsAuth() {
+			credentials.DetectDefaultStore(configFile)
 		}
 		cli.configFile = configFile
 
@@ -115,12 +147,12 @@ func NewDockerCli(in io.ReadCloser, out, err io.Writer, clientFlags *cli.ClientF
 			verStr = tmpStr
 		}
 
-		clientTransport, err := newClientTransport(clientFlags.Common.TLSOptions)
+		httpClient, err := newHTTPClient(host, clientFlags.Common.TLSOptions)
 		if err != nil {
 			return err
 		}
 
-		client, err := client.NewClient(host, verStr, clientTransport, customHeaders)
+		client, err := client.NewClient(host, verStr, httpClient, customHeaders)
 		if err != nil {
 			return err
 		}
@@ -149,25 +181,31 @@ func getServerHost(hosts []string, tlsOptions *tlsconfig.Options) (host string, 
 		return "", errors.New("Please specify only one -H")
 	}
 
-	defaultHost := opts.DefaultTCPHost
-	if tlsOptions != nil {
-		defaultHost = opts.DefaultTLSHost
-	}
-
-	host, err = opts.ParseHost(defaultHost, host)
+	host, err = opts.ParseHost(tlsOptions != nil, host)
 	return
 }
 
-func newClientTransport(tlsOptions *tlsconfig.Options) (*http.Transport, error) {
+func newHTTPClient(host string, tlsOptions *tlsconfig.Options) (*http.Client, error) {
 	if tlsOptions == nil {
-		return &http.Transport{}, nil
+		// let the api client configure the default transport.
+		return nil, nil
 	}
 
 	config, err := tlsconfig.Client(*tlsOptions)
 	if err != nil {
 		return nil, err
 	}
-	return &http.Transport{
+	tr := &http.Transport{
 		TLSClientConfig: config,
+	}
+	proto, addr, _, err := client.ParseHost(host)
+	if err != nil {
+		return nil, err
+	}
+
+	sockets.ConfigureTransport(tr, proto, addr)
+
+	return &http.Client{
+		Transport: tr,
 	}, nil
 }

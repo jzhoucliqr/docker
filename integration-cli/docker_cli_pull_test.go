@@ -62,6 +62,7 @@ func (s *DockerHubPullSuite) TestPullNonExistingImage(c *check.C) {
 			out, err := s.CmdWithError("pull", "-a", e.Alias)
 			c.Assert(err, checker.NotNil, check.Commentf("expected non-zero exit status when pulling non-existing image: %s", out))
 			c.Assert(out, checker.Contains, fmt.Sprintf("Error: image %s not found", e.Repo), check.Commentf("expected image not found error messages"))
+			c.Assert(out, checker.Not(checker.Contains), "unauthorized", check.Commentf(`message should not contain "unauthorized"`))
 		}
 	}
 
@@ -85,6 +86,23 @@ func (s *DockerHubPullSuite) TestPullFromCentralRegistryImplicitRefParts(c *chec
 		"index.docker.io/library/hello-world",
 	} {
 		out := s.Cmd(c, "pull", i)
+		v1Retries := 0
+		for strings.Contains(out, "this image was pulled from a legacy registry") {
+			// Some network errors may cause fallbacks to the v1
+			// protocol, which would violate the test's assumption
+			// that it will get the same images. To make the test
+			// more robust against these network glitches, allow a
+			// few retries if we end up with a v1 pull.
+
+			if v1Retries > 2 {
+				c.Fatalf("too many v1 fallback incidents when pulling %s", i)
+			}
+
+			s.Cmd(c, "rmi", i)
+			out = s.Cmd(c, "pull", i)
+
+			v1Retries++
+		}
 		c.Assert(out, checker.Contains, "Image is up to date for hello-world:latest")
 	}
 

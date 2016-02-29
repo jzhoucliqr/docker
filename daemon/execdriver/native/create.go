@@ -9,8 +9,8 @@ import (
 	"syscall"
 
 	"github.com/docker/docker/daemon/execdriver"
-	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/pkg/mount"
+	"github.com/docker/docker/profiles/seccomp"
 
 	"github.com/docker/docker/volume"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
@@ -71,7 +71,10 @@ func (d *Driver) createContainer(c *execdriver.Command, hooks execdriver.Hooks) 
 		}
 
 		if c.SeccompProfile == "" {
-			container.Seccomp = getDefaultSeccompProfile()
+			container.Seccomp, err = seccomp.GetDefaultProfile()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	// add CAP_ prefix to all caps for new libcontainer update to match
@@ -88,7 +91,7 @@ func (d *Driver) createContainer(c *execdriver.Command, hooks execdriver.Hooks) 
 	}
 
 	if c.SeccompProfile != "" && c.SeccompProfile != "unconfined" {
-		container.Seccomp, err = loadSeccompProfile(c.SeccompProfile)
+		container.Seccomp, err = seccomp.LoadProfile(c.SeccompProfile)
 		if err != nil {
 			return nil, err
 		}
@@ -103,7 +106,7 @@ func (d *Driver) createContainer(c *execdriver.Command, hooks execdriver.Hooks) 
 	if container.Readonlyfs {
 		for i := range container.Mounts {
 			switch container.Mounts[i].Destination {
-			case "/proc", "/dev", "/dev/pts":
+			case "/proc", "/dev", "/dev/pts", "/dev/mqueue":
 				continue
 			}
 			container.Mounts[i].Flags |= syscall.MS_RDONLY
@@ -286,7 +289,7 @@ func (d *Driver) setupRlimits(container *configs.Config, c *execdriver.Command) 
 
 // If rootfs mount propagation is RPRIVATE, that means all the volumes are
 // going to be private anyway. There is no need to apply per volume
-// propagation on top. This is just an optimzation so that cost of per volume
+// propagation on top. This is just an optimization so that cost of per volume
 // propagation is paid only if user decides to make some volume non-private
 // which will force rootfs mount propagation to be non RPRIVATE.
 func checkResetVolumePropagation(container *configs.Config) {
@@ -344,7 +347,7 @@ func getSourceMount(source string) (string, string, error) {
 	return "", "", fmt.Errorf("Could not find source mount of %s", source)
 }
 
-// Ensure mount point on which path is mouted, is shared.
+// Ensure mount point on which path is mounted, is shared.
 func ensureShared(path string) error {
 	sharedMount := false
 
@@ -426,7 +429,7 @@ func (d *Driver) setupMounts(container *configs.Config, c *execdriver.Command) e
 	for _, m := range c.Mounts {
 		for _, cm := range container.Mounts {
 			if cm.Destination == m.Destination {
-				return derr.ErrorCodeMountDup.WithArgs(m.Destination)
+				return fmt.Errorf("Duplicate mount point '%s'", m.Destination)
 			}
 		}
 
@@ -436,7 +439,6 @@ func (d *Driver) setupMounts(container *configs.Config, c *execdriver.Command) e
 				flags = syscall.MS_NOEXEC | syscall.MS_NOSUID | syscall.MS_NODEV
 				err   error
 			)
-			fulldest := filepath.Join(c.Rootfs, m.Destination)
 			if m.Data != "" {
 				flags, data, err = mount.ParseTmpfsOptions(m.Data)
 				if err != nil {
@@ -449,8 +451,6 @@ func (d *Driver) setupMounts(container *configs.Config, c *execdriver.Command) e
 				Data:             data,
 				Device:           "tmpfs",
 				Flags:            flags,
-				PremountCmds:     genTmpfsPremountCmd(c.TmpDir, fulldest, m.Destination),
-				PostmountCmds:    genTmpfsPostmountCmd(c.TmpDir, fulldest, m.Destination),
 				PropagationFlags: []int{mountPropagationMap[volume.DefaultPropagationMode]},
 			})
 			continue
@@ -462,7 +462,7 @@ func (d *Driver) setupMounts(container *configs.Config, c *execdriver.Command) e
 		}
 
 		// Determine property of RootPropagation based on volume
-		// properties. If a volume is shared, then keep root propagtion
+		// properties. If a volume is shared, then keep root propagation
 		// shared. This should work for slave and private volumes too.
 		//
 		// For slave volumes, it can be either [r]shared/[r]slave.

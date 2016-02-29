@@ -167,7 +167,7 @@ Under the hood
 Under the hood, Docker is built on the following components:
 
 * The
-  [cgroups](https://www.kernel.org/doc/Documentation/cgroups/cgroups.txt)
+  [cgroups](https://www.kernel.org/doc/Documentation/cgroup-v1/cgroups.txt)
   and
   [namespaces](http://man7.org/linux/man-pages/man7/namespaces.7.html)
   capabilities of the Linux kernel
@@ -216,7 +216,7 @@ We are always open to suggestions on process improvements, and are always lookin
     <td>Internet&nbsp;Relay&nbsp;Chat&nbsp;(IRC)</td>
     <td>
       <p>
-        IRC a direct line to our most knowledgeable Docker users; we have
+        IRC is a direct line to our most knowledgeable Docker users; we have
         both the  <code>#docker</code> and <code>#docker-dev</code> group on
         <strong>irc.freenode.net</strong>.
         IRC is a rich chat protocol but it can overwhelm new users. You can search
@@ -234,6 +234,8 @@ We are always open to suggestions on process improvements, and are always lookin
       The <a href="https://groups.google.com/forum/#!forum/docker-dev" target="_blank">docker-dev</a>
       group is for contributors and other people contributing to the Docker
       project.
+      You can join them without an google account by sending an email to e.g. "docker-user+subscribe@googlegroups.com".
+      After receiving the join-request message, you can simply reply to that to confirm the subscribtion.
     </td>
   </tr>
   <tr>

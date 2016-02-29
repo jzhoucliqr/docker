@@ -1,22 +1,17 @@
 package daemon
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/docker/docker/container"
-	derr "github.com/docker/docker/errors"
 	volumestore "github.com/docker/docker/volume/store"
 )
 
 func (daemon *Daemon) prepareMountPoints(container *container.Container) error {
 	for _, config := range container.MountPoints {
-		if len(config.Driver) > 0 {
-			v, err := daemon.volumes.GetWithRef(config.Name, config.Driver, container.ID)
-			if err != nil {
-				return err
-			}
-
-			config.Volume = v
+		if err := daemon.lazyInitializeVolume(container.ID, config); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -30,6 +25,11 @@ func (daemon *Daemon) removeMountPoints(container *container.Container, rm bool)
 		}
 		daemon.volumes.Dereference(m.Volume, container.ID)
 		if rm {
+			// Do not remove named mountpoints
+			// these are mountpoints specified like `docker run -v <name>:/foo`
+			if m.Named {
+				continue
+			}
 			err := daemon.volumes.Remove(m.Volume)
 			// Ignore volume in use errors because having this
 			// volume being referenced by other container is
@@ -42,7 +42,7 @@ func (daemon *Daemon) removeMountPoints(container *container.Container, rm bool)
 		}
 	}
 	if len(rmErrors) > 0 {
-		return derr.ErrorCodeRemovingVolume.WithArgs(strings.Join(rmErrors, "\n"))
+		return fmt.Errorf("Error removing volumes:\n%v", strings.Join(rmErrors, "\n"))
 	}
 	return nil
 }

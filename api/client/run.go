@@ -7,15 +7,22 @@ import (
 	"runtime"
 	"strings"
 
+	"golang.org/x/net/context"
+
 	"github.com/Sirupsen/logrus"
 	Cli "github.com/docker/docker/cli"
-	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/promise"
 	"github.com/docker/docker/pkg/signal"
+	"github.com/docker/docker/pkg/stringid"
 	runconfigopts "github.com/docker/docker/runconfig/opts"
 	"github.com/docker/engine-api/types"
 	"github.com/docker/libnetwork/resolvconf/dns"
+)
+
+const (
+	errCmdNotFound          = "Container command not found or does not exist."
+	errCmdCouldNotBeInvoked = "Container command could not be invoked."
 )
 
 func (cid *cidFile) Close() error {
@@ -43,20 +50,13 @@ func (cid *cidFile) Write(id string) error {
 // return 125 for generic docker daemon failures
 func runStartContainerErr(err error) error {
 	trimmedErr := strings.Trim(err.Error(), "Error response from daemon: ")
-	statusError := Cli.StatusError{}
-	derrCmdNotFound := derr.ErrorCodeCmdNotFound.Message()
-	derrCouldNotInvoke := derr.ErrorCodeCmdCouldNotBeInvoked.Message()
-	derrNoSuchImage := derr.ErrorCodeNoSuchImageHash.Message()
-	derrNoSuchImageTag := derr.ErrorCodeNoSuchImageTag.Message()
+	statusError := Cli.StatusError{StatusCode: 125}
+
 	switch trimmedErr {
-	case derrCmdNotFound:
+	case errCmdNotFound:
 		statusError = Cli.StatusError{StatusCode: 127}
-	case derrCouldNotInvoke:
+	case errCmdCouldNotBeInvoked:
 		statusError = Cli.StatusError{StatusCode: 126}
-	case derrNoSuchImage, derrNoSuchImageTag:
-		statusError = Cli.StatusError{StatusCode: 125}
-	default:
-		statusError = Cli.StatusError{StatusCode: 125}
 	}
 	return statusError
 }
@@ -90,8 +90,8 @@ func (cli *DockerCli) CmdRun(args ...string) error {
 		os.Exit(125)
 	}
 
-	if hostConfig.OomKillDisable && hostConfig.Memory == 0 {
-		fmt.Fprintf(cli.err, "WARNING: Dangerous only disable the OOM Killer on containers but not set the '-m/--memory' option\n")
+	if hostConfig.OomKillDisable != nil && *hostConfig.OomKillDisable && hostConfig.Memory == 0 {
+		fmt.Fprintf(cli.err, "WARNING: Disabling the OOM killer on containers without setting a '-m/--memory' limit may be dangerous.\n")
 	}
 
 	if len(hostConfig.DNS) > 0 {
@@ -207,22 +207,24 @@ func (cli *DockerCli) CmdRun(args ...string) error {
 		if err != nil {
 			return err
 		}
+		if in != nil && config.Tty {
+			if err := cli.setRawTerminal(); err != nil {
+				return err
+			}
+			defer cli.restoreTerminal(in)
+		}
 		errCh = promise.Go(func() error {
 			return cli.holdHijackedConnection(config.Tty, in, out, stderr, resp)
 		})
 	}
 
-	defer func() {
-		if *flAutoRemove {
-			options := types.ContainerRemoveOptions{
-				ContainerID:   createResponse.ID,
-				RemoveVolumes: true,
+	if *flAutoRemove {
+		defer func() {
+			if err := cli.removeContainer(createResponse.ID, true, false, false); err != nil {
+				fmt.Fprintf(cli.err, "%v\n", err)
 			}
-			if err := cli.client.ContainerRemove(options); err != nil {
-				fmt.Fprintf(cli.err, "Error deleting container: %s\n", err)
-			}
-		}
-	}()
+		}()
+	}
 
 	//start the container
 	if err := cli.client.ContainerStart(createResponse.ID); err != nil {
@@ -254,9 +256,19 @@ func (cli *DockerCli) CmdRun(args ...string) error {
 
 	// Attached mode
 	if *flAutoRemove {
+		// Warn user if they detached us
+		js, err := cli.client.ContainerInspect(createResponse.ID)
+		if err != nil {
+			return runStartContainerErr(err)
+		}
+		if js.State.Running == true || js.State.Paused == true {
+			fmt.Fprintf(cli.out, "Detached from %s, awaiting its termination in order to uphold \"--rm\".\n",
+				stringid.TruncateID(createResponse.ID))
+		}
+
 		// Autoremove: wait for the container to finish, retrieve
 		// the exit code and remove the container
-		if status, err = cli.client.ContainerWait(createResponse.ID); err != nil {
+		if status, err = cli.client.ContainerWait(context.Background(), createResponse.ID); err != nil {
 			return runStartContainerErr(err)
 		}
 		if _, status, err = getExitCode(cli, createResponse.ID); err != nil {
@@ -266,7 +278,7 @@ func (cli *DockerCli) CmdRun(args ...string) error {
 		// No Autoremove: Simply retrieve the exit code
 		if !config.Tty {
 			// In non-TTY mode, we can't detach, so we must wait for container exit
-			if status, err = cli.client.ContainerWait(createResponse.ID); err != nil {
+			if status, err = cli.client.ContainerWait(context.Background(), createResponse.ID); err != nil {
 				return err
 			}
 		} else {

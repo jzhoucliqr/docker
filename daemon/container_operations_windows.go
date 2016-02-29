@@ -3,12 +3,12 @@
 package daemon
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/execdriver"
 	"github.com/docker/docker/daemon/execdriver/windows"
-	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/layer"
 	networktypes "github.com/docker/engine-api/types/network"
 	"github.com/docker/libnetwork"
@@ -32,8 +32,13 @@ func (daemon *Daemon) ConnectToNetwork(container *container.Container, idOrName 
 	return nil
 }
 
+// ForceEndpointDelete deletes an endpoing from a network forcefully
+func (daemon *Daemon) ForceEndpointDelete(name string, n libnetwork.Network) error {
+	return nil
+}
+
 // DisconnectFromNetwork disconnects a container from the network.
-func (daemon *Daemon) DisconnectFromNetwork(container *container.Container, n libnetwork.Network) error {
+func (daemon *Daemon) DisconnectFromNetwork(container *container.Container, n libnetwork.Network, force bool) error {
 	return nil
 }
 
@@ -49,7 +54,7 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 		if !c.Config.NetworkDisabled {
 			en.Interface = &execdriver.NetworkInterface{
 				MacAddress:   c.Config.MacAddress,
-				Bridge:       daemon.configStore.Bridge.VirtualSwitchName,
+				Bridge:       daemon.configStore.bridgeConfig.VirtualSwitchName,
 				PortBindings: c.HostConfig.PortBindings,
 
 				// TODO Windows. Include IPAddress. There already is a
@@ -59,7 +64,7 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 			}
 		}
 	default:
-		return derr.ErrorCodeInvalidNetworkMode.WithArgs(c.HostConfig.NetworkMode)
+		return fmt.Errorf("invalid network mode: %s", c.HostConfig.NetworkMode)
 	}
 
 	// TODO Windows. More resource controls to be implemented later.
@@ -83,7 +88,7 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 	var layerPaths []string
 	img, err := daemon.imageStore.Get(c.ImageID)
 	if err != nil {
-		return derr.ErrorCodeGetGraph.WithArgs(c.ImageID, err)
+		return fmt.Errorf("Failed to graph.Get on ImageID %s - %s", c.ImageID, err)
 	}
 
 	if img.RootFS != nil && img.RootFS.Type == "layers+base" {
@@ -92,7 +97,7 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 			img.RootFS.DiffIDs = img.RootFS.DiffIDs[:i]
 			path, err := layer.GetLayerPath(daemon.layerStore, img.RootFS.ChainID())
 			if err != nil {
-				return derr.ErrorCodeGetLayer.WithArgs(err)
+				return fmt.Errorf("Failed to get layer path from graphdriver %s for ImageID %s - %s", daemon.layerStore, img.RootFS.ChainID(), err)
 			}
 			// Reverse order, expecting parent most first
 			layerPaths = append([]string{path}, layerPaths...)
@@ -101,7 +106,7 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 
 	m, err := c.RWLayer.Metadata()
 	if err != nil {
-		return derr.ErrorCodeGetLayerMetadata.WithArgs(err)
+		return fmt.Errorf("Failed to get layer metadata - %s", err)
 	}
 	layerFolder := m["dir"]
 
@@ -119,7 +124,6 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 		CommonCommand: execdriver.CommonCommand{
 			ID:            c.ID,
 			Rootfs:        c.BaseFS,
-			InitPath:      "/.dockerinit",
 			WorkingDir:    c.Config.WorkingDir,
 			Network:       en,
 			MountLabel:    c.GetMountLabel(),

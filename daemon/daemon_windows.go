@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -18,8 +19,10 @@ import (
 	containertypes "github.com/docker/engine-api/types/container"
 	// register the windows graph driver
 	"github.com/docker/docker/daemon/graphdriver/windows"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/libnetwork"
+	nwconfig "github.com/docker/libnetwork/config"
 	blkiodev "github.com/opencontainers/runc/libcontainer/configs"
 )
 
@@ -82,12 +85,12 @@ func (daemon *Daemon) adaptContainerSettings(hostConfig *containertypes.HostConf
 
 // verifyPlatformContainerSettings performs platform-specific validation of the
 // hostconfig and config structures.
-func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.HostConfig, config *containertypes.Config) ([]string, error) {
+func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.HostConfig, config *containertypes.Config, update bool) ([]string, error) {
 	return nil, nil
 }
 
-// checkConfigOptions checks for mutually incompatible config options
-func checkConfigOptions(config *Config) error {
+// verifyDaemonSettings performs validation of daemon config struct
+func verifyDaemonSettings(config *Config) error {
 	return nil
 }
 
@@ -113,14 +116,19 @@ func configureKernelSecuritySupport(config *Config, driverName string) error {
 	return nil
 }
 
+// configureMaxThreads sets the Go runtime max threads threshold
+func configureMaxThreads(config *Config) error {
+	return nil
+}
+
 func isBridgeNetworkDisabled(config *Config) bool {
 	return false
 }
 
 func (daemon *Daemon) initNetworkController(config *Config) (libnetwork.NetworkController, error) {
 	// Set the name of the virtual switch if not specified by -b on daemon start
-	if config.Bridge.VirtualSwitchName == "" {
-		config.Bridge.VirtualSwitchName = defaultVirtualSwitch
+	if config.bridgeConfig.VirtualSwitchName == "" {
+		config.bridgeConfig.VirtualSwitchName = defaultVirtualSwitch
 	}
 	return nil, nil
 }
@@ -132,6 +140,19 @@ func (daemon *Daemon) registerLinks(container *container.Container, hostConfig *
 }
 
 func (daemon *Daemon) cleanupMounts() error {
+	return nil
+}
+
+func setupRemappedRoot(config *Config) ([]idtools.IDMap, []idtools.IDMap, error) {
+	return nil, nil, nil
+}
+
+func setupDaemonRoot(config *Config, rootDir string, rootUID, rootGID int) error {
+	config.Root = rootDir
+	// Create the root directory if it doesn't exists
+	if err := system.MkdirAll(config.Root, 0700); err != nil && !os.IsExist(err) {
+		return err
+	}
 	return nil
 }
 
@@ -230,4 +251,8 @@ func restoreCustomImage(is image.Store, ls layer.Store, rs reference.Store) erro
 		logrus.Debugf("Registered base layer %s as %s", ref, id)
 	}
 	return nil
+}
+
+func (daemon *Daemon) networkOptions(dconfig *Config) ([]nwconfig.Option, error) {
+	return nil, fmt.Errorf("Network controller config reload not aavailable on Windows yet")
 }

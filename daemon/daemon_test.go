@@ -3,12 +3,15 @@ package daemon
 import (
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/container"
-	"github.com/docker/docker/pkg/graphdb"
+	"github.com/docker/docker/pkg/discovery"
+	_ "github.com/docker/docker/pkg/discovery/memory"
+	"github.com/docker/docker/pkg/registrar"
 	"github.com/docker/docker/pkg/truncindex"
 	"github.com/docker/docker/volume"
 	volumedrivers "github.com/docker/docker/volume/drivers"
@@ -58,15 +61,12 @@ func TestGetContainer(t *testing.T) {
 		},
 	}
 
-	store := &contStore{
-		s: map[string]*container.Container{
-			c1.ID: c1,
-			c2.ID: c2,
-			c3.ID: c3,
-			c4.ID: c4,
-			c5.ID: c5,
-		},
-	}
+	store := container.NewMemoryStore()
+	store.Add(c1.ID, c1)
+	store.Add(c2.ID, c2)
+	store.Add(c3.ID, c3)
+	store.Add(c4.ID, c4)
+	store.Add(c5.ID, c5)
 
 	index := truncindex.NewTruncIndex([]string{})
 	index.Add(c1.ID)
@@ -75,22 +75,17 @@ func TestGetContainer(t *testing.T) {
 	index.Add(c4.ID)
 	index.Add(c5.ID)
 
-	daemonTestDbPath := path.Join(os.TempDir(), "daemon_test.db")
-	graph, err := graphdb.NewSqliteConn(daemonTestDbPath)
-	if err != nil {
-		t.Fatalf("Failed to create daemon test sqlite database at %s", daemonTestDbPath)
-	}
-	graph.Set(c1.Name, c1.ID)
-	graph.Set(c2.Name, c2.ID)
-	graph.Set(c3.Name, c3.ID)
-	graph.Set(c4.Name, c4.ID)
-	graph.Set(c5.Name, c5.ID)
-
 	daemon := &Daemon{
-		containers:       store,
-		idIndex:          index,
-		containerGraphDB: graph,
+		containers: store,
+		idIndex:    index,
+		nameIndex:  registrar.NewRegistrar(),
 	}
+
+	daemon.reserveName(c1.ID, c1.Name)
+	daemon.reserveName(c2.ID, c2.Name)
+	daemon.reserveName(c3.ID, c3.Name)
+	daemon.reserveName(c4.ID, c4.Name)
+	daemon.reserveName(c5.ID, c5.Name)
 
 	if container, _ := daemon.GetContainer("3cdbd1aa394fd68559fd1441d6eff2ab7c1e6363582c82febfaa8045df3bd8de"); container != c2 {
 		t.Fatal("Should explicitly match full container IDs")
@@ -120,8 +115,6 @@ func TestGetContainer(t *testing.T) {
 	if _, err := daemon.GetContainer("nothing"); err == nil {
 		t.Fatal("Should return an error when provided a prefix that is neither a name or a partial match to an ID")
 	}
-
-	os.Remove(daemonTestDbPath)
 }
 
 func initDaemonWithVolumeStore(tmp string) (*Daemon, error) {
@@ -138,85 +131,6 @@ func initDaemonWithVolumeStore(tmp string) (*Daemon, error) {
 	volumedrivers.Register(volumesDriver, volumesDriver.Name())
 
 	return daemon, nil
-}
-
-func TestParseSecurityOpt(t *testing.T) {
-	container := &container.Container{}
-	config := &containertypes.HostConfig{}
-
-	// test apparmor
-	config.SecurityOpt = []string{"apparmor:test_profile"}
-	if err := parseSecurityOpt(container, config); err != nil {
-		t.Fatalf("Unexpected parseSecurityOpt error: %v", err)
-	}
-	if container.AppArmorProfile != "test_profile" {
-		t.Fatalf("Unexpected AppArmorProfile, expected: \"test_profile\", got %q", container.AppArmorProfile)
-	}
-
-	// test seccomp
-	sp := "/path/to/seccomp_test.json"
-	config.SecurityOpt = []string{"seccomp:" + sp}
-	if err := parseSecurityOpt(container, config); err != nil {
-		t.Fatalf("Unexpected parseSecurityOpt error: %v", err)
-	}
-	if container.SeccompProfile != sp {
-		t.Fatalf("Unexpected AppArmorProfile, expected: %q, got %q", sp, container.SeccompProfile)
-	}
-
-	// test valid label
-	config.SecurityOpt = []string{"label:user:USER"}
-	if err := parseSecurityOpt(container, config); err != nil {
-		t.Fatalf("Unexpected parseSecurityOpt error: %v", err)
-	}
-
-	// test invalid label
-	config.SecurityOpt = []string{"label"}
-	if err := parseSecurityOpt(container, config); err == nil {
-		t.Fatal("Expected parseSecurityOpt error, got nil")
-	}
-
-	// test invalid opt
-	config.SecurityOpt = []string{"test"}
-	if err := parseSecurityOpt(container, config); err == nil {
-		t.Fatal("Expected parseSecurityOpt error, got nil")
-	}
-}
-
-func TestNetworkOptions(t *testing.T) {
-	daemon := &Daemon{}
-	dconfigCorrect := &Config{
-		CommonConfig: CommonConfig{
-			ClusterStore:     "consul://localhost:8500",
-			ClusterAdvertise: "192.168.0.1:8000",
-		},
-	}
-
-	if _, err := daemon.networkOptions(dconfigCorrect); err != nil {
-		t.Fatalf("Expect networkOptions sucess, got error: %v", err)
-	}
-
-	dconfigWrong := &Config{
-		CommonConfig: CommonConfig{
-			ClusterStore: "consul://localhost:8500://test://bbb",
-		},
-	}
-
-	if _, err := daemon.networkOptions(dconfigWrong); err == nil {
-		t.Fatalf("Expected networkOptions error, got nil")
-	}
-}
-
-func TestGetFullName(t *testing.T) {
-	name, err := GetFullContainerName("testing")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if name != "/testing" {
-		t.Fatalf("Expected /testing got %s", name)
-	}
-	if _, err := GetFullContainerName(""); err == nil {
-		t.Fatal("Error should not be nil")
-	}
 }
 
 func TestValidContainerNames(t *testing.T) {
@@ -391,4 +305,198 @@ func TestMerge(t *testing.T) {
 			t.Fatalf("Expected %q or %q or %q or %q, found %s", 0, 1111, 2222, 3333, portSpecs)
 		}
 	}
+}
+
+func TestDaemonReloadLabels(t *testing.T) {
+	daemon := &Daemon{}
+	daemon.configStore = &Config{
+		CommonConfig: CommonConfig{
+			Labels: []string{"foo:bar"},
+		},
+	}
+
+	valuesSets := make(map[string]interface{})
+	valuesSets["label"] = "foo:baz"
+	newConfig := &Config{
+		CommonConfig: CommonConfig{
+			Labels:    []string{"foo:baz"},
+			valuesSet: valuesSets,
+		},
+	}
+
+	daemon.Reload(newConfig)
+	label := daemon.configStore.Labels[0]
+	if label != "foo:baz" {
+		t.Fatalf("Expected daemon label `foo:baz`, got %s", label)
+	}
+}
+
+func TestDaemonReloadNotAffectOthers(t *testing.T) {
+	daemon := &Daemon{}
+	daemon.configStore = &Config{
+		CommonConfig: CommonConfig{
+			Labels: []string{"foo:bar"},
+			Debug:  true,
+		},
+	}
+
+	valuesSets := make(map[string]interface{})
+	valuesSets["label"] = "foo:baz"
+	newConfig := &Config{
+		CommonConfig: CommonConfig{
+			Labels:    []string{"foo:baz"},
+			valuesSet: valuesSets,
+		},
+	}
+
+	daemon.Reload(newConfig)
+	label := daemon.configStore.Labels[0]
+	if label != "foo:baz" {
+		t.Fatalf("Expected daemon label `foo:baz`, got %s", label)
+	}
+	debug := daemon.configStore.Debug
+	if !debug {
+		t.Fatalf("Expected debug 'enabled', got 'disabled'")
+	}
+}
+
+func TestDaemonDiscoveryReload(t *testing.T) {
+	daemon := &Daemon{}
+	daemon.configStore = &Config{
+		CommonConfig: CommonConfig{
+			ClusterStore:     "memory://127.0.0.1",
+			ClusterAdvertise: "127.0.0.1:3333",
+		},
+	}
+
+	if err := daemon.initDiscovery(daemon.configStore); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := discovery.Entries{
+		&discovery.Entry{Host: "127.0.0.1", Port: "3333"},
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	ch, errCh := daemon.discoveryWatcher.Watch(stopCh)
+
+	select {
+	case <-time.After(1 * time.Second):
+		t.Fatal("failed to get discovery advertisements in time")
+	case e := <-ch:
+		if !reflect.DeepEqual(e, expected) {
+			t.Fatalf("expected %v, got %v\n", expected, e)
+		}
+	case e := <-errCh:
+		t.Fatal(e)
+	}
+
+	valuesSets := make(map[string]interface{})
+	valuesSets["cluster-store"] = "memory://127.0.0.1:2222"
+	valuesSets["cluster-advertise"] = "127.0.0.1:5555"
+	newConfig := &Config{
+		CommonConfig: CommonConfig{
+			ClusterStore:     "memory://127.0.0.1:2222",
+			ClusterAdvertise: "127.0.0.1:5555",
+			valuesSet:        valuesSets,
+		},
+	}
+
+	expected = discovery.Entries{
+		&discovery.Entry{Host: "127.0.0.1", Port: "5555"},
+	}
+
+	if err := daemon.Reload(newConfig); err != nil {
+		t.Fatal(err)
+	}
+	ch, errCh = daemon.discoveryWatcher.Watch(stopCh)
+
+	select {
+	case <-time.After(1 * time.Second):
+		t.Fatal("failed to get discovery advertisements in time")
+	case e := <-ch:
+		if !reflect.DeepEqual(e, expected) {
+			t.Fatalf("expected %v, got %v\n", expected, e)
+		}
+	case e := <-errCh:
+		t.Fatal(e)
+	}
+}
+
+func TestDaemonDiscoveryReloadFromEmptyDiscovery(t *testing.T) {
+	daemon := &Daemon{}
+	daemon.configStore = &Config{}
+
+	valuesSet := make(map[string]interface{})
+	valuesSet["cluster-store"] = "memory://127.0.0.1:2222"
+	valuesSet["cluster-advertise"] = "127.0.0.1:5555"
+	newConfig := &Config{
+		CommonConfig: CommonConfig{
+			ClusterStore:     "memory://127.0.0.1:2222",
+			ClusterAdvertise: "127.0.0.1:5555",
+			valuesSet:        valuesSet,
+		},
+	}
+
+	expected := discovery.Entries{
+		&discovery.Entry{Host: "127.0.0.1", Port: "5555"},
+	}
+
+	if err := daemon.Reload(newConfig); err != nil {
+		t.Fatal(err)
+	}
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	ch, errCh := daemon.discoveryWatcher.Watch(stopCh)
+
+	select {
+	case <-time.After(1 * time.Second):
+		t.Fatal("failed to get discovery advertisements in time")
+	case e := <-ch:
+		if !reflect.DeepEqual(e, expected) {
+			t.Fatalf("expected %v, got %v\n", expected, e)
+		}
+	case e := <-errCh:
+		t.Fatal(e)
+	}
+}
+
+func TestDaemonDiscoveryReloadOnlyClusterAdvertise(t *testing.T) {
+	daemon := &Daemon{}
+	daemon.configStore = &Config{
+		CommonConfig: CommonConfig{
+			ClusterStore: "memory://127.0.0.1",
+		},
+	}
+	valuesSets := make(map[string]interface{})
+	valuesSets["cluster-advertise"] = "127.0.0.1:5555"
+	newConfig := &Config{
+		CommonConfig: CommonConfig{
+			ClusterAdvertise: "127.0.0.1:5555",
+			valuesSet:        valuesSets,
+		},
+	}
+	expected := discovery.Entries{
+		&discovery.Entry{Host: "127.0.0.1", Port: "5555"},
+	}
+
+	if err := daemon.Reload(newConfig); err != nil {
+		t.Fatal(err)
+	}
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	ch, errCh := daemon.discoveryWatcher.Watch(stopCh)
+
+	select {
+	case <-time.After(1 * time.Second):
+		t.Fatal("failed to get discovery advertisements in time")
+	case e := <-ch:
+		if !reflect.DeepEqual(e, expected) {
+			t.Fatalf("expected %v, got %v\n", expected, e)
+		}
+	case e := <-errCh:
+		t.Fatal(e)
+	}
+
 }

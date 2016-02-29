@@ -1,15 +1,18 @@
 package authorization
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/pkg/ioutils"
 )
+
+const maxBodySize = 1048576 // 1MB
 
 // NewCtx creates new authZ context, it is used to store authorization information related to a specific docker
 // REST http session
@@ -51,17 +54,9 @@ type Ctx struct {
 // AuthZRequest authorized the request to the docker daemon using authZ plugins
 func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
 	var body []byte
-	if sendBody(ctx.requestURI, r.Header) {
-		var (
-			err         error
-			drainedBody io.ReadCloser
-		)
-		drainedBody, r.Body, err = drainBody(r.Body)
-		if err != nil {
-			return err
-		}
-		defer drainedBody.Close()
-		body, err = ioutil.ReadAll(drainedBody)
+	if sendBody(ctx.requestURI, r.Header) && r.ContentLength > 0 && r.ContentLength < maxBodySize {
+		var err error
+		body, r.Body, err = drainBody(r.Body)
 		if err != nil {
 			return err
 		}
@@ -119,22 +114,28 @@ func (ctx *Ctx) AuthZResponse(rm ResponseModifier, r *http.Request) error {
 		}
 	}
 
-	rm.Flush()
+	rm.FlushAll()
 
 	return nil
 }
 
-// drainBody dump the body, it reads the body data into memory and
-// see go sources /go/src/net/http/httputil/dump.go
-func drainBody(b io.ReadCloser) (io.ReadCloser, io.ReadCloser, error) {
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(b); err != nil {
-		return nil, nil, err
+// drainBody dump the body (if it's length is less than 1MB) without modifying the request state
+func drainBody(body io.ReadCloser) ([]byte, io.ReadCloser, error) {
+	bufReader := bufio.NewReaderSize(body, maxBodySize)
+	newBody := ioutils.NewReadCloserWrapper(bufReader, func() error { return body.Close() })
+
+	data, err := bufReader.Peek(maxBodySize)
+	// Body size exceeds max body size
+	if err == nil {
+		logrus.Warnf("Request body is larger than: '%d' skipping body", maxBodySize)
+		return nil, newBody, nil
 	}
-	if err := b.Close(); err != nil {
-		return nil, nil, err
+	// Body size is less than maximum size
+	if err == io.EOF {
+		return data, newBody, nil
 	}
-	return ioutil.NopCloser(&buf), ioutil.NopCloser(bytes.NewReader(buf.Bytes())), nil
+	// Unknown error
+	return nil, newBody, err
 }
 
 // sendBody returns true when request/response body should be sent to AuthZPlugin
@@ -145,8 +146,7 @@ func sendBody(url string, header http.Header) bool {
 	}
 
 	// body is sent only for text or json messages
-	v := header.Get("Content-Type")
-	return strings.HasPrefix(v, "text/") || v == "application/json"
+	return header.Get("Content-Type") == "application/json"
 }
 
 // headers returns flatten version of the http headers excluding authorization

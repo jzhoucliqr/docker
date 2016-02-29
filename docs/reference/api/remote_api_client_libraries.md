@@ -4,7 +4,8 @@ title = "Remote API client libraries"
 description = "Various client libraries available to use with the Docker remote API"
 keywords = ["API, Docker, index, registry, REST, documentation, clients, C#, Erlang, Go, Groovy, Java, JavaScript, Perl, PHP, Python, Ruby, Rust,  Scala"]
 [menu.main]
-parent="mn_reference"
+parent="engine_remoteapi"
+weight = 90
 +++
 <![end-metadata]-->
 
@@ -53,6 +54,12 @@ will add the libraries here.
       <td>Dart</td>
       <td>bwu_docker</td>
       <td><a class="reference external" href="https://github.com/bwu-dart/bwu_docker">https://github.com/bwu-dart/bwu_docker</a></td>
+      <td>Active</td>
+    </tr>
+    <tr>
+      <td>Go</td>
+      <td>engine-api</td>
+      <td><a class="reference external" href="https://github.com/docker/engine-api">https://github.com/docker/engine-api</a></td>
       <td>Active</td>
     </tr>
     <tr>
@@ -113,6 +120,12 @@ will add the libraries here.
       <td>Java</td>
       <td>rx-docker-client</td>
       <td><a class="reference external" href="https://github.com/shekhargulati/rx-docker-client">https://github.com/shekhargulati/rx-docker-client</a></td>
+      <td>Active</td>
+    </tr>
+    <tr>
+      <td>JavaScript (NodeJS)</td>
+      <td>dockerizer</td>
+      <td><a class="reference external" href="https://github.com/kesarion/dockerizer">https://github.com/kesarion/dockerizer</a></td>
       <td>Active</td>
     </tr>
     <tr>
@@ -180,7 +193,13 @@ will add the libraries here.
     <tr>
       <td>PHP</td>
       <td>Docker-PHP</td>
-      <td><a class="reference external" href="http://stage1.github.io/docker-php/">http://stage1.github.io/docker-php/</a></td>
+      <td><a class="reference external" href="https://github.com/docker-php/docker-php">https://github.com/docker-php/docker-php</a></td>
+      <td>Active</td>
+    </tr>
+    <tr>
+      <td>PHP</td>
+      <td>Docker-PHP-Client</td>
+      <td><a class="reference external" href="https://github.com/jarkt/docker-php-client">https://github.com/jarkt/docker-php-client</a></td>
       <td>Active</td>
     </tr>
     <tr>

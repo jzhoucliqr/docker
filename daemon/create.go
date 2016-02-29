@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"fmt"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/container"
-	derr "github.com/docker/docker/errors"
+	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/idtools"
@@ -18,12 +20,17 @@ import (
 // ContainerCreate creates a container.
 func (daemon *Daemon) ContainerCreate(params types.ContainerCreateConfig) (types.ContainerCreateResponse, error) {
 	if params.Config == nil {
-		return types.ContainerCreateResponse{}, derr.ErrorCodeEmptyConfig
+		return types.ContainerCreateResponse{}, fmt.Errorf("Config cannot be empty in order to create a container")
 	}
 
-	warnings, err := daemon.verifyContainerSettings(params.HostConfig, params.Config)
+	warnings, err := daemon.verifyContainerSettings(params.HostConfig, params.Config, false)
 	if err != nil {
 		return types.ContainerCreateResponse{Warnings: warnings}, err
+	}
+
+	err = daemon.verifyNetworkingConfig(params.NetworkingConfig)
+	if err != nil {
+		return types.ContainerCreateResponse{}, err
 	}
 
 	if params.HostConfig == nil {
@@ -74,6 +81,11 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig) (retC *containe
 		}
 	}()
 
+	logCfg := container.GetLogConfig(daemon.defaultLogConfig)
+	if err := logger.ValidateLogOpts(logCfg.Type, logCfg.Config); err != nil {
+		return nil, err
+	}
+
 	if err := daemon.setSecurityOptions(container, params.HostConfig); err != nil {
 		return nil, err
 	}
@@ -105,7 +117,7 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig) (retC *containe
 		}
 	}()
 
-	if err := daemon.createContainerPlatformSpecificSettings(container, params.Config, params.HostConfig, img); err != nil {
+	if err := daemon.createContainerPlatformSpecificSettings(container, params.Config, params.HostConfig); err != nil {
 		return nil, err
 	}
 
@@ -169,7 +181,7 @@ func (daemon *Daemon) VolumeCreate(name, driverName string, opts map[string]stri
 	v, err := daemon.volumes.Create(name, driverName, opts)
 	if err != nil {
 		if volumestore.IsNameConflict(err) {
-			return nil, derr.ErrorVolumeNameTaken.WithArgs(name)
+			return nil, fmt.Errorf("A volume named %s already exists. Choose a different volume name.", name)
 		}
 		return nil, err
 	}
